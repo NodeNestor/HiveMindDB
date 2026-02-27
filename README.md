@@ -233,6 +233,42 @@ Full REST API at `http://localhost:8100/api/v1/`:
 | `/agents/:id/heartbeat` | POST | Agent heartbeat |
 | `/status` | GET | Cluster stats |
 
+### Request Body Examples
+
+**POST /api/v1/relationships**
+```json
+{
+  "source_entity_id": 1,
+  "target_entity_id": 2,
+  "relation_type": "uses",
+  "created_by": "agent-1"
+}
+```
+Required: `source_entity_id`, `target_entity_id`, `relation_type`, `created_by`
+
+**POST /api/v1/channels**
+```json
+{
+  "name": "general",
+  "created_by": "agent-1",
+  "description": "General discussion channel",
+  "channel_type": "broadcast"
+}
+```
+Required: `name`, `created_by`. Optional: `description`, `channel_type`
+
+**POST /api/v1/agents/register**
+```json
+{
+  "agent_id": "agent-1",
+  "name": "Claude Code",
+  "agent_type": "claude",
+  "capabilities": ["code", "memory"],
+  "metadata": {}
+}
+```
+Required: `agent_id`, `name`, `agent_type`. Optional: `capabilities`, `metadata`
+
 WebSocket at `ws://localhost:8100/ws` for real-time channel subscriptions.
 
 ## Configuration
