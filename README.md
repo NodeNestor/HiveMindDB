@@ -6,8 +6,11 @@
 
 Distributed, fault-tolerant memory system for AI agents — knowledge graphs, semantic search, LLM extraction, real-time hivemind channels, all replicated via Raft consensus.
 
+[![CI](https://github.com/NodeNestor/HiveMindDB/actions/workflows/ci.yml/badge.svg)](https://github.com/NodeNestor/HiveMindDB/actions)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org)
+
+[Quick Start](#quick-start) | [Features](#features) | [Architecture](#architecture) | [API](#api) | [Contributing](CONTRIBUTING.md)
 
 </div>
 
@@ -26,12 +29,42 @@ Agent 3 knows it instantly ◄── real-time push ◄── identical
 
 ## Quick Start
 
-### With Claude Code (one command)
+### Option 1: Docker Compose (easiest)
+
+Spins up the full stack locally — SpacetimeDB + RaftTimeDB + HiveMindDB sidecars.
 
 ```bash
-# Start HiveMindDB
-docker compose -f deploy/docker/docker-compose.yml up -d
+git clone https://github.com/NodeNestor/HiveMindDB.git
+cd HiveMindDB/deploy/docker
+docker compose up -d
+```
 
+Connect your agent to `http://localhost:8100`.
+
+### Option 2: Pre-built Binary
+
+Download from [Releases](https://github.com/NodeNestor/HiveMindDB/releases) for your platform:
+
+| Platform | Binary |
+|----------|--------|
+| Linux x86_64 | `hiveminddb-x86_64-unknown-linux-gnu` |
+| Windows x86_64 | `hiveminddb-x86_64-pc-windows-msvc.exe` |
+| macOS ARM | `hiveminddb-aarch64-apple-darwin` |
+
+```bash
+hiveminddb --listen-addr 0.0.0.0:8100
+```
+
+### Option 3: Build from Source
+
+```bash
+cargo install --path crates/core    # hiveminddb server
+cargo install --path crates/cli     # hmdb CLI
+```
+
+### With Claude Code
+
+```bash
 # Add MCP server to Claude Code
 claude mcp add hivemind -- npx hiveminddb-mcp --url http://localhost:8100
 
@@ -216,6 +249,18 @@ WebSocket at `ws://localhost:8100/ws` for real-time channel subscriptions.
 | `HIVEMIND_DATA_DIR` | `./data` | Snapshot directory |
 | `HIVEMIND_SNAPSHOT_INTERVAL` | `60` | Snapshot interval (seconds) |
 | `HIVEMIND_ENABLE_REPLICATION` | `false` | Enable Raft replication |
+
+## Building from Source
+
+```bash
+cargo build                    # Build core + CLI
+cargo test                     # Run all tests
+cd crates/mcp-server && npm install  # Install MCP server deps
+```
+
+## Contributing
+
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
