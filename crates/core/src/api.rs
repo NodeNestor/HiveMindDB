@@ -1,3 +1,4 @@
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -9,6 +10,7 @@ use tower_http::cors::CorsLayer;
 use crate::channels::ChannelHub;
 use crate::memory_engine::MemoryEngine;
 use crate::types::*;
+use crate::websocket;
 
 pub struct AppState {
     pub engine: Arc<MemoryEngine>,
@@ -28,6 +30,8 @@ pub fn router(engine: Arc<MemoryEngine>, channels: Arc<ChannelHub>) -> Router {
         .route("/api/v1/memories", get(list_memories))
         // Search
         .route("/api/v1/search", post(search))
+        // Extraction
+        .route("/api/v1/extract", post(extract))
         // Knowledge Graph
         .route("/api/v1/entities", post(add_entity))
         .route("/api/v1/entities/{id}", get(get_entity))
@@ -43,6 +47,8 @@ pub fn router(engine: Arc<MemoryEngine>, channels: Arc<ChannelHub>) -> Router {
         .route("/api/v1/agents/register", post(register_agent))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/{agent_id}/heartbeat", post(agent_heartbeat))
+        // WebSocket
+        .route("/ws", get(ws_upgrade))
         // Status
         .route("/api/v1/status", get(status))
         .route("/health", get(health))
@@ -72,6 +78,15 @@ async fn add_memory(
         );
     }
 
+    // Broadcast to global channel
+    state.channels.broadcast_to_channel_by_name(
+        "global",
+        WsServerMessage::MemoryAdded {
+            channel: "global".into(),
+            memory: memory.clone(),
+        },
+    );
+
     (StatusCode::CREATED, Json(memory))
 }
 
@@ -91,11 +106,24 @@ async fn update_memory(
     Path(id): Path<u64>,
     Json(req): Json<UpdateMemoryRequest>,
 ) -> Result<Json<Memory>, StatusCode> {
-    state
+    let memory = state
         .engine
         .update_memory(id, req, "api")
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Broadcast update
+    if let Some(ref user_id) = memory.user_id {
+        let channel_name = format!("user:{}", user_id);
+        state.channels.broadcast_to_channel_by_name(
+            &channel_name,
+            WsServerMessage::MemoryUpdated {
+                channel: channel_name.clone(),
+                memory: memory.clone(),
+            },
+        );
+    }
+
+    Ok(Json(memory))
 }
 
 #[derive(serde::Deserialize)]
@@ -114,11 +142,25 @@ async fn invalidate_memory(
     Path(id): Path<u64>,
     Json(req): Json<InvalidateRequest>,
 ) -> Result<Json<Memory>, StatusCode> {
-    state
+    let memory = state
         .engine
         .invalidate_memory(id, &req.reason, &req.changed_by)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Broadcast invalidation
+    if let Some(ref user_id) = memory.user_id {
+        let channel_name = format!("user:{}", user_id);
+        state.channels.broadcast_to_channel_by_name(
+            &channel_name,
+            WsServerMessage::MemoryInvalidated {
+                channel: channel_name.clone(),
+                memory_id: id,
+                reason: req.reason.clone(),
+            },
+        );
+    }
+
+    Ok(Json(memory))
 }
 
 async fn memory_history(
@@ -148,14 +190,47 @@ async fn list_memories(
 }
 
 // ============================================================================
-// Search
+// Search (Hybrid: keyword + vector)
 // ============================================================================
 
 async fn search(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SearchRequest>,
 ) -> Json<Vec<SearchResult>> {
-    Json(state.engine.search(&req))
+    // Use hybrid search (includes vector similarity when available)
+    Json(state.engine.search_hybrid(&req).await)
+}
+
+// ============================================================================
+// Extraction (LLM-powered)
+// ============================================================================
+
+async fn extract(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ExtractRequest>,
+) -> Result<(StatusCode, Json<ExtractResponse>), (StatusCode, String)> {
+    match state.engine.extract_and_store(&req).await {
+        Ok(response) => {
+            // Broadcast new memories to channels
+            for memory in &response.memories_added {
+                if let Some(ref user_id) = memory.user_id {
+                    let channel_name = format!("user:{}", user_id);
+                    state.channels.broadcast_to_channel_by_name(
+                        &channel_name,
+                        WsServerMessage::MemoryAdded {
+                            channel: channel_name.clone(),
+                            memory: memory.clone(),
+                        },
+                    );
+                }
+            }
+            Ok((StatusCode::OK, Json(response)))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Extraction failed: {}", e),
+        )),
+    }
 }
 
 // ============================================================================
@@ -296,6 +371,18 @@ async fn agent_heartbeat(
 ) -> StatusCode {
     state.engine.heartbeat_agent(&agent_id);
     StatusCode::OK
+}
+
+// ============================================================================
+// WebSocket
+// ============================================================================
+
+async fn ws_upgrade(
+    State(state): State<Arc<AppState>>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let channels = state.channels.clone();
+    ws.on_upgrade(move |socket| websocket::handle_ws_connection(socket, channels))
 }
 
 // ============================================================================

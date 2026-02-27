@@ -1,17 +1,25 @@
 use crate::config::HiveMindConfig;
+use crate::embeddings::{self, EmbeddingEngine};
+use crate::extraction::{ExtractionOperation, ExtractionPipeline};
+use crate::persistence::{ReplicationEvent, Snapshot};
 use crate::types::*;
 use chrono::Utc;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::info;
+use std::sync::Arc;
+use tracing::{info, warn};
 
 /// Core memory engine — manages memories, entities, relationships, and search.
 ///
-/// Phase 1: In-memory store with full CRUD and basic search.
-/// Phase 2+: Backed by SpacetimeDB via RaftTimeDB for distributed replication.
+/// Integrates:
+/// - In-memory stores (DashMap) for low-latency access
+/// - LLM extraction pipeline for automatic knowledge extraction
+/// - Vector embeddings for semantic search
+/// - Snapshot persistence for restart recovery
+/// - Replication events for multi-node sync via RaftTimeDB
 pub struct MemoryEngine {
     config: HiveMindConfig,
-    // In-memory stores (Phase 1 — will be replaced by SpacetimeDB subscriptions)
+    // In-memory stores
     memories: DashMap<u64, Memory>,
     entities: DashMap<u64, Entity>,
     relationships: DashMap<u64, Relationship>,
@@ -23,11 +31,20 @@ pub struct MemoryEngine {
     next_relationship_id: AtomicU64,
     next_episode_id: AtomicU64,
     next_history_id: AtomicU64,
+    // Extraction pipeline (LLM-powered)
+    extraction: ExtractionPipeline,
+    // Embedding engine (vector search)
+    embeddings: Arc<EmbeddingEngine>,
+    // Replication event sender (optional)
+    replication_tx: Option<tokio::sync::mpsc::UnboundedSender<ReplicationEvent>>,
 }
 
 impl MemoryEngine {
     pub fn new(config: HiveMindConfig) -> Self {
         info!("Initializing memory engine");
+        let extraction = ExtractionPipeline::from_hivemind_config(&config);
+        let embeddings = Arc::new(EmbeddingEngine::from_hivemind_config(&config));
+
         Self {
             config,
             memories: DashMap::new(),
@@ -41,6 +58,93 @@ impl MemoryEngine {
             next_relationship_id: AtomicU64::new(1),
             next_episode_id: AtomicU64::new(1),
             next_history_id: AtomicU64::new(1),
+            extraction,
+            embeddings,
+            replication_tx: None,
+        }
+    }
+
+    /// Set the replication event sender for RaftTimeDB sync.
+    pub fn set_replication_tx(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<ReplicationEvent>,
+    ) {
+        self.replication_tx = Some(tx);
+    }
+
+    /// Get a reference to the embedding engine (for async operations).
+    pub fn embeddings(&self) -> &Arc<EmbeddingEngine> {
+        &self.embeddings
+    }
+
+    /// Restore state from a snapshot (called at startup).
+    pub fn restore_from_snapshot(&mut self, snapshot: Snapshot) {
+        let mut max_memory_id = 0u64;
+        let mut max_entity_id = 0u64;
+        let mut max_rel_id = 0u64;
+        let mut max_episode_id = 0u64;
+        let mut max_history_id = 0u64;
+
+        for memory in snapshot.memories {
+            max_memory_id = max_memory_id.max(memory.id);
+            self.memories.insert(memory.id, memory);
+        }
+        for entity in snapshot.entities {
+            max_entity_id = max_entity_id.max(entity.id);
+            self.entities.insert(entity.id, entity);
+        }
+        for rel in snapshot.relationships {
+            max_rel_id = max_rel_id.max(rel.id);
+            self.relationships.insert(rel.id, rel);
+        }
+        for episode in snapshot.episodes {
+            max_episode_id = max_episode_id.max(episode.id);
+            self.episodes.insert(episode.id, episode);
+        }
+        for agent in snapshot.agents {
+            self.agents.insert(agent.agent_id.clone(), agent);
+        }
+        for (memory_id, hist_entries) in snapshot.history {
+            for h in &hist_entries {
+                max_history_id = max_history_id.max(h.id);
+            }
+            self.history.insert(memory_id, hist_entries);
+        }
+
+        // Set counters past the max existing IDs
+        self.next_memory_id.store(max_memory_id + 1, Ordering::Relaxed);
+        self.next_entity_id.store(max_entity_id + 1, Ordering::Relaxed);
+        self.next_relationship_id.store(max_rel_id + 1, Ordering::Relaxed);
+        self.next_episode_id.store(max_episode_id + 1, Ordering::Relaxed);
+        self.next_history_id.store(max_history_id + 1, Ordering::Relaxed);
+
+        info!(
+            memories = self.memories.len(),
+            entities = self.entities.len(),
+            relationships = self.relationships.len(),
+            agents = self.agents.len(),
+            "State restored from snapshot"
+        );
+    }
+
+    /// Create a snapshot of current state.
+    pub fn create_snapshot(&self) -> Snapshot {
+        Snapshot {
+            version: Snapshot::CURRENT_VERSION,
+            created_at: Utc::now(),
+            memories: self.memories.iter().map(|m| m.value().clone()).collect(),
+            entities: self.entities.iter().map(|e| e.value().clone()).collect(),
+            relationships: self.relationships.iter().map(|r| r.value().clone()).collect(),
+            episodes: self.episodes.iter().map(|e| e.value().clone()).collect(),
+            agents: self.agents.iter().map(|a| a.value().clone()).collect(),
+            history: self.history.iter().map(|h| (*h.key(), h.value().clone())).collect(),
+            channels: vec![], // Channels are managed by ChannelHub
+        }
+    }
+
+    fn emit_replication(&self, event: ReplicationEvent) {
+        if let Some(ref tx) = self.replication_tx {
+            let _ = tx.send(event);
         }
     }
 
@@ -83,6 +187,21 @@ impl MemoryEngine {
         };
         self.history.entry(id).or_default().push(hist);
         self.memories.insert(id, memory.clone());
+
+        // Async: index embedding (fire-and-forget)
+        if self.embeddings.is_available() {
+            let emb = self.embeddings.clone();
+            let mem = memory.clone();
+            tokio::spawn(async move {
+                if let Err(e) = emb.index_memory(&mem).await {
+                    warn!(memory_id = mem.id, error = %e, "Failed to index memory embedding");
+                }
+            });
+        }
+
+        self.emit_replication(ReplicationEvent::MemoryAdded {
+            memory: memory.clone(),
+        });
 
         info!(id, "Memory added");
         memory
@@ -130,6 +249,22 @@ impl MemoryEngine {
         self.history.entry(id).or_default().push(hist);
 
         let memory = entry.clone();
+
+        // Re-index embedding if content changed
+        if req.content.is_some() && self.embeddings.is_available() {
+            let emb = self.embeddings.clone();
+            let mem = memory.clone();
+            tokio::spawn(async move {
+                if let Err(e) = emb.index_memory(&mem).await {
+                    warn!(memory_id = mem.id, error = %e, "Failed to re-index memory embedding");
+                }
+            });
+        }
+
+        self.emit_replication(ReplicationEvent::MemoryUpdated {
+            memory: memory.clone(),
+        });
+
         info!(id, "Memory updated");
         Some(memory)
     }
@@ -152,7 +287,16 @@ impl MemoryEngine {
         };
         self.history.entry(id).or_default().push(hist);
 
+        // Remove from embedding index
+        self.embeddings.remove_memory(id);
+
         let memory = entry.clone();
+
+        self.emit_replication(ReplicationEvent::MemoryInvalidated {
+            memory_id: id,
+            reason: reason.into(),
+        });
+
         info!(id, reason, "Memory invalidated");
         Some(memory)
     }
@@ -165,12 +309,89 @@ impl MemoryEngine {
     }
 
     // ========================================================================
-    // Search
+    // Search (Hybrid: keyword + vector)
     // ========================================================================
 
-    /// Basic keyword search across memories (Phase 1).
-    /// Phase 2 adds vector similarity search.
+    /// Hybrid search combining keyword matching and vector similarity.
+    ///
+    /// If embeddings are available, uses 70% vector + 30% keyword scoring.
+    /// Falls back to pure keyword search if embeddings are not configured.
     pub fn search(&self, req: &SearchRequest) -> Vec<SearchResult> {
+        self.search_keyword(req)
+    }
+
+    /// Async search that includes vector similarity when embeddings are available.
+    pub async fn search_hybrid(&self, req: &SearchRequest) -> Vec<SearchResult> {
+        // Get keyword results
+        let keyword_results = self.search_keyword(req);
+
+        // If embeddings aren't available, return keyword results
+        if !self.embeddings.is_available() || self.embeddings.indexed_count() == 0 {
+            return keyword_results;
+        }
+
+        // Get vector similarity scores
+        let vector_scores = match self.embeddings.search(&req.query, req.limit * 2).await {
+            Ok(scores) => scores,
+            Err(e) => {
+                warn!(error = %e, "Vector search failed, using keyword only");
+                return keyword_results;
+            }
+        };
+
+        // Build a map of memory_id → vector_score
+        let vector_map: std::collections::HashMap<u64, f32> =
+            vector_scores.into_iter().collect();
+
+        // Merge: for each keyword result, enhance with vector score
+        let mut results: Vec<SearchResult> = keyword_results
+            .into_iter()
+            .map(|mut r| {
+                if let Some(&vec_score) = vector_map.get(&r.memory.id) {
+                    r.score = embeddings::hybrid_score(r.score, vec_score, 0.7);
+                }
+                r
+            })
+            .collect();
+
+        // Add any vector-only results (high vector score but no keyword match)
+        for (memory_id, vec_score) in &vector_map {
+            if !results.iter().any(|r| r.memory.id == *memory_id) {
+                if let Some(memory) = self.get_memory(*memory_id) {
+                    // Apply filters
+                    if memory.valid_until.is_some() {
+                        continue;
+                    }
+                    if let Some(ref agent_id) = req.agent_id {
+                        if memory.agent_id.as_ref() != Some(agent_id) && memory.agent_id.is_some() {
+                            continue;
+                        }
+                    }
+                    if let Some(ref user_id) = req.user_id {
+                        if memory.user_id.as_ref() != Some(user_id) && memory.user_id.is_some() {
+                            continue;
+                        }
+                    }
+                    if *vec_score > 0.3 {
+                        // Minimum threshold for vector-only results
+                        results.push(SearchResult {
+                            memory,
+                            score: embeddings::hybrid_score(0.0, *vec_score, 0.7),
+                            related_entities: vec![],
+                            related_relationships: vec![],
+                        });
+                    }
+                }
+            }
+        }
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(req.limit);
+        results
+    }
+
+    /// Keyword-only search (synchronous, always available).
+    fn search_keyword(&self, req: &SearchRequest) -> Vec<SearchResult> {
         let query_lower = req.query.to_lowercase();
 
         let mut results: Vec<SearchResult> = self
@@ -178,35 +399,29 @@ impl MemoryEngine {
             .iter()
             .filter(|entry| {
                 let m = entry.value();
-                // Filter out invalidated memories
                 if m.valid_until.is_some() {
                     return false;
                 }
-                // Filter by agent_id if specified
                 if let Some(ref agent_id) = req.agent_id {
                     if m.agent_id.as_ref() != Some(agent_id) && m.agent_id.is_some() {
                         return false;
                     }
                 }
-                // Filter by user_id if specified
                 if let Some(ref user_id) = req.user_id {
                     if m.user_id.as_ref() != Some(user_id) && m.user_id.is_some() {
                         return false;
                     }
                 }
-                // Filter by tags if specified
                 if !req.tags.is_empty()
                     && !req.tags.iter().any(|t| m.tags.contains(t))
                 {
                     return false;
                 }
-                // Keyword match (Phase 1 — replaced by vector search in Phase 2)
                 m.content.to_lowercase().contains(&query_lower)
                     || m.tags.iter().any(|t| t.to_lowercase().contains(&query_lower))
             })
             .map(|entry| {
                 let m = entry.value();
-                // Simple relevance scoring based on keyword frequency
                 let content_lower = m.content.to_lowercase();
                 let score = if content_lower == query_lower {
                     1.0
@@ -264,6 +479,147 @@ impl MemoryEngine {
     }
 
     // ========================================================================
+    // LLM Extraction
+    // ========================================================================
+
+    /// Extract knowledge from conversation using the LLM pipeline.
+    ///
+    /// Automatically:
+    /// - Extracts facts and stores them as memories
+    /// - Creates entities in the knowledge graph
+    /// - Creates relationships between entities
+    /// - Handles conflict resolution (add/update/noop)
+    pub async fn extract_and_store(
+        &self,
+        req: &ExtractRequest,
+    ) -> anyhow::Result<ExtractResponse> {
+        if !self.extraction.is_available() {
+            anyhow::bail!("Extraction pipeline not configured — set LLM API key or use a local provider");
+        }
+
+        // Gather existing memories for conflict resolution
+        let existing: Vec<Memory> = self.list_memories(
+            req.agent_id.as_deref(),
+            req.user_id.as_deref(),
+            false,
+        );
+
+        let result = self
+            .extraction
+            .extract(&req.messages, &existing)
+            .await?;
+
+        let mut response = ExtractResponse {
+            memories_added: vec![],
+            memories_updated: vec![],
+            entities_added: vec![],
+            relationships_added: vec![],
+            skipped: 0,
+        };
+
+        // Process extracted facts
+        for fact in &result.facts {
+            match fact.operation {
+                ExtractionOperation::Add => {
+                    let memory = self.add_memory(AddMemoryRequest {
+                        content: fact.content.clone(),
+                        memory_type: fact.memory_type.clone(),
+                        agent_id: req.agent_id.clone(),
+                        user_id: req.user_id.clone(),
+                        session_id: req.session_id.clone(),
+                        tags: fact.tags.clone(),
+                        metadata: serde_json::json!({
+                            "confidence": fact.confidence,
+                            "extracted": true,
+                        }),
+                    });
+                    response.memories_added.push(memory);
+                }
+                ExtractionOperation::Update => {
+                    if let Some(target_id) = fact.updates_memory_id {
+                        if let Some(updated) = self.update_memory(
+                            target_id,
+                            UpdateMemoryRequest {
+                                content: Some(fact.content.clone()),
+                                tags: Some(fact.tags.clone()),
+                                confidence: Some(fact.confidence),
+                                metadata: None,
+                            },
+                            req.agent_id.as_deref().unwrap_or("extraction"),
+                        ) {
+                            response.memories_updated.push(updated);
+                        }
+                    } else {
+                        // No target ID — add as new memory
+                        let memory = self.add_memory(AddMemoryRequest {
+                            content: fact.content.clone(),
+                            memory_type: fact.memory_type.clone(),
+                            agent_id: req.agent_id.clone(),
+                            user_id: req.user_id.clone(),
+                            session_id: req.session_id.clone(),
+                            tags: fact.tags.clone(),
+                            metadata: serde_json::json!({
+                                "confidence": fact.confidence,
+                                "extracted": true,
+                            }),
+                        });
+                        response.memories_added.push(memory);
+                    }
+                }
+                ExtractionOperation::Noop => {
+                    response.skipped += 1;
+                }
+            }
+        }
+
+        // Process extracted entities
+        for entity in &result.entities {
+            // Check if entity already exists
+            if self.find_entity_by_name(&entity.name).is_some() {
+                continue;
+            }
+            let e = self.add_entity(AddEntityRequest {
+                name: entity.name.clone(),
+                entity_type: entity.entity_type.clone(),
+                description: entity.description.clone(),
+                agent_id: req.agent_id.clone(),
+                metadata: serde_json::json!({"extracted": true}),
+            });
+            response.entities_added.push(e);
+        }
+
+        // Process extracted relationships
+        for rel in &result.relationships {
+            let source = self.find_entity_by_name(&rel.source_entity);
+            let target = self.find_entity_by_name(&rel.target_entity);
+
+            if let (Some(src), Some(tgt)) = (source, target) {
+                let r = self.add_relationship(AddRelationshipRequest {
+                    source_entity_id: src.id,
+                    target_entity_id: tgt.id,
+                    relation_type: rel.relation_type.clone(),
+                    description: rel.description.clone(),
+                    weight: 1.0,
+                    created_by: req.agent_id.clone().unwrap_or_else(|| "extraction".into()),
+                    metadata: serde_json::json!({"extracted": true}),
+                });
+                response.relationships_added.push(r);
+            }
+        }
+
+        info!(
+            added = response.memories_added.len(),
+            updated = response.memories_updated.len(),
+            entities = response.entities_added.len(),
+            relationships = response.relationships_added.len(),
+            skipped = response.skipped,
+            "Extraction processed"
+        );
+
+        Ok(response)
+    }
+
+    // ========================================================================
     // Knowledge Graph
     // ========================================================================
 
@@ -283,6 +639,11 @@ impl MemoryEngine {
         };
 
         self.entities.insert(id, entity.clone());
+
+        self.emit_replication(ReplicationEvent::EntityAdded {
+            entity: entity.clone(),
+        });
+
         info!(id, name = %entity.name, "Entity added");
         entity
     }
@@ -317,6 +678,11 @@ impl MemoryEngine {
         };
 
         self.relationships.insert(id, rel.clone());
+
+        self.emit_replication(ReplicationEvent::RelationshipAdded {
+            relationship: rel.clone(),
+        });
+
         info!(id, src = req.source_entity_id, dst = req.target_entity_id, "Relationship added");
         rel
     }
@@ -402,6 +768,11 @@ impl MemoryEngine {
         };
 
         self.agents.insert(req.agent_id.clone(), agent.clone());
+
+        self.emit_replication(ReplicationEvent::AgentRegistered {
+            agent: agent.clone(),
+        });
+
         info!(agent_id = %req.agent_id, "Agent registered");
         agent
     }
@@ -433,6 +804,10 @@ impl MemoryEngine {
             "episodes": self.episodes.len(),
             "agents": self.agents.len(),
             "valid_memories": self.memories.iter().filter(|m| m.value().valid_until.is_none()).count(),
+            "embeddings_indexed": self.embeddings.indexed_count(),
+            "embedding_dimensions": self.embeddings.dimensions(),
+            "extraction_available": self.extraction.is_available(),
+            "replication_enabled": self.replication_tx.is_some(),
         })
     }
 }
@@ -528,7 +903,6 @@ mod tests {
             .unwrap();
         assert!(invalidated.valid_until.is_some());
 
-        // Should not appear in search results
         let results = engine.search(&SearchRequest {
             query: "works at Acme".into(),
             agent_id: None,
@@ -567,7 +941,7 @@ mod tests {
         engine.invalidate_memory(mem.id, "outdated", "test");
 
         let history = engine.get_memory_history(mem.id);
-        assert_eq!(history.len(), 3); // Add + Update + Invalidate
+        assert_eq!(history.len(), 3);
         assert_eq!(history[0].operation, Operation::Add);
         assert_eq!(history[1].operation, Operation::Update);
         assert_eq!(history[2].operation, Operation::Invalidate);
@@ -618,7 +992,6 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].memory.content.contains("dark mode"));
 
-        // Search by tag
         let results = engine.search(&SearchRequest {
             query: "preferences".into(),
             agent_id: None,
@@ -749,14 +1122,12 @@ mod tests {
             metadata: serde_json::Value::Null,
         });
 
-        // Depth 1: should find A and B
         let result = engine.traverse(a.id, 1);
         let names: Vec<&str> = result.iter().map(|(e, _)| e.name.as_str()).collect();
         assert!(names.contains(&"A"));
         assert!(names.contains(&"B"));
         assert!(!names.contains(&"C"));
 
-        // Depth 2: should find A, B, and C
         let result = engine.traverse(a.id, 2);
         let names: Vec<&str> = result.iter().map(|(e, _)| e.name.as_str()).collect();
         assert!(names.contains(&"A"));
@@ -778,7 +1149,6 @@ mod tests {
 
         let found = engine.find_entity_by_name("rafttimedb").unwrap();
         assert_eq!(found.name, "RaftTimeDB");
-
         assert!(engine.find_entity_by_name("nonexistent").is_none());
     }
 
@@ -827,5 +1197,52 @@ mod tests {
         assert_eq!(stats["memories"], 1);
         assert_eq!(stats["entities"], 1);
         assert_eq!(stats["valid_memories"], 1);
+        assert_eq!(stats["embeddings_indexed"], 0);
+    }
+
+    #[test]
+    fn test_snapshot_roundtrip() {
+        let engine = MemoryEngine::new(test_config());
+
+        engine.add_memory(AddMemoryRequest {
+            content: "Snapshot test memory".into(),
+            memory_type: MemoryType::Fact,
+            agent_id: Some("agent-1".into()),
+            user_id: Some("user-1".into()),
+            session_id: None,
+            tags: vec!["test".into()],
+            metadata: serde_json::Value::Null,
+        });
+
+        engine.add_entity(AddEntityRequest {
+            name: "SnapshotEntity".into(),
+            entity_type: "Test".into(),
+            description: None,
+            agent_id: None,
+            metadata: serde_json::Value::Null,
+        });
+
+        let snapshot = engine.create_snapshot();
+        assert_eq!(snapshot.memories.len(), 1);
+        assert_eq!(snapshot.entities.len(), 1);
+
+        // Restore into a new engine
+        let mut engine2 = MemoryEngine::new(test_config());
+        engine2.restore_from_snapshot(snapshot);
+
+        assert_eq!(engine2.get_memory(1).unwrap().content, "Snapshot test memory");
+        assert_eq!(engine2.find_entity_by_name("SnapshotEntity").unwrap().name, "SnapshotEntity");
+
+        // IDs should continue past the restored state
+        let new_mem = engine2.add_memory(AddMemoryRequest {
+            content: "New memory after restore".into(),
+            memory_type: MemoryType::Fact,
+            agent_id: None,
+            user_id: None,
+            session_id: None,
+            tags: vec![],
+            metadata: serde_json::Value::Null,
+        });
+        assert!(new_mem.id > 1);
     }
 }
