@@ -7,10 +7,11 @@
  * distributed memory via HiveMindDB.
  *
  * Compatible with AgentCore's agent-memory interface (remember, recall, forget,
- * search, list_topics) PLUS extended HiveMindDB tools (graph, channels, etc.)
+ * search, list_topics) PLUS extended HiveMindDB tools (graph, channels,
+ * extraction, etc.)
  *
  * Usage:
- *   npx hiveminddb-mcp --url ws://localhost:8100
+ *   npx hiveminddb-mcp --url http://localhost:8100
  *   # or with env:
  *   HIVEMINDDB_URL=http://localhost:8100 npx hiveminddb-mcp
  */
@@ -101,7 +102,7 @@ const TOOLS = [
   {
     name: "search",
     description:
-      "Search across all memories by keyword or semantic query. Returns ranked results.",
+      "Search across all memories by keyword or semantic query. Uses hybrid search (keyword + vector similarity when embeddings are configured).",
     inputSchema: {
       type: "object",
       properties: {
@@ -148,7 +149,7 @@ const TOOLS = [
   {
     name: "memory_search",
     description:
-      "Semantic search across all memories with filters. Returns ranked results with scores.",
+      "Hybrid search (keyword + vector similarity) across all memories with filters.",
     inputSchema: {
       type: "object",
       properties: {
@@ -177,6 +178,31 @@ const TOOLS = [
         },
       },
       required: ["memory_id"],
+    },
+  },
+  {
+    name: "extract",
+    description:
+      "Extract knowledge from conversation text using LLM. Automatically identifies facts, entities, relationships, and handles conflict resolution with existing memories.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messages: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              role: { type: "string", description: "Message role (user, assistant, system)" },
+              content: { type: "string", description: "Message content" },
+            },
+            required: ["role", "content"],
+          },
+          description: "Conversation messages to extract knowledge from",
+        },
+        agent_id: { type: "string", description: "Agent performing extraction" },
+        user_id: { type: "string", description: "User the conversation is about" },
+      },
+      required: ["messages"],
     },
   },
   {
@@ -231,9 +257,22 @@ const TOOLS = [
     },
   },
   {
+    name: "graph_traverse",
+    description:
+      "Traverse the knowledge graph from an entity, exploring connected entities up to a given depth.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        entity_id: { type: "number", description: "Starting entity ID" },
+        depth: { type: "number", description: "Max traversal depth (default: 2)" },
+      },
+      required: ["entity_id"],
+    },
+  },
+  {
     name: "channel_create",
     description:
-      "Create a hivemind channel for sharing memories between agents.",
+      "Create a hivemind channel for sharing memories between agents in real-time.",
     inputSchema: {
       type: "object",
       properties: {
@@ -258,6 +297,11 @@ const TOOLS = [
       },
       required: ["channel_id", "memory_id"],
     },
+  },
+  {
+    name: "channel_list",
+    description: "List all hivemind channels.",
+    inputSchema: { type: "object", properties: {} },
   },
   {
     name: "agent_register",
@@ -286,6 +330,11 @@ const TOOLS = [
     description: "List all agents registered in the hivemind and their status.",
     inputSchema: { type: "object", properties: {} },
   },
+  {
+    name: "hivemind_status",
+    description: "Get HiveMindDB cluster status — memory counts, embedding stats, extraction availability.",
+    inputSchema: { type: "object", properties: {} },
+  },
 ];
 
 // ============================================================================
@@ -311,17 +360,14 @@ async function handleTool(name, args) {
         tags: [args.topic],
         limit: 50,
       });
-      if (results.length === 0) return `No memories found for topic "${args.topic}"`;
+      if (results.length === 0)
+        return `No memories found for topic "${args.topic}"`;
       return results
-        .map(
-          (r) =>
-            `[${r.memory.created_at}] ${r.memory.content}`
-        )
+        .map((r) => `[${r.memory.created_at}] ${r.memory.content}`)
         .join("\n\n");
     }
 
     case "forget": {
-      // Search for memories with this topic tag and invalidate them
       const results = await apiCall("POST", "/api/v1/search", {
         query: args.topic,
         tags: [args.topic],
@@ -352,7 +398,9 @@ async function handleTool(name, args) {
         .map(
           (r) =>
             `[#${r.memory.id} score:${r.score.toFixed(2)}] ${r.memory.content}` +
-            (r.memory.tags.length ? `\n  tags: ${r.memory.tags.join(", ")}` : "")
+            (r.memory.tags.length
+              ? `\n  tags: ${r.memory.tags.join(", ")}`
+              : "")
         )
         .join("\n\n");
     }
@@ -362,7 +410,8 @@ async function handleTool(name, args) {
       const topics = {};
       for (const m of memories) {
         for (const tag of m.tags) {
-          if (!topics[tag]) topics[tag] = { count: 0, last_updated: m.updated_at };
+          if (!topics[tag])
+            topics[tag] = { count: 0, last_updated: m.updated_at };
           topics[tag].count++;
           if (m.updated_at > topics[tag].last_updated) {
             topics[tag].last_updated = m.updated_at;
@@ -371,7 +420,10 @@ async function handleTool(name, args) {
       }
       if (Object.keys(topics).length === 0) return "No topics found.";
       return Object.entries(topics)
-        .map(([name, info]) => `${name}: ${info.count} memories (last: ${info.last_updated})`)
+        .map(
+          ([name, info]) =>
+            `${name}: ${info.count} memories (last: ${info.last_updated})`
+        )
         .join("\n");
     }
 
@@ -406,6 +458,44 @@ async function handleTool(name, args) {
       return JSON.stringify(history, null, 2);
     }
 
+    case "extract": {
+      const result = await apiCall("POST", "/api/v1/extract", {
+        messages: args.messages,
+        agent_id: args.agent_id,
+        user_id: args.user_id,
+      });
+      const summary = [];
+      if (result.memories_added.length > 0) {
+        summary.push(`Added ${result.memories_added.length} memories:`);
+        for (const m of result.memories_added) {
+          summary.push(`  #${m.id}: ${m.content}`);
+        }
+      }
+      if (result.memories_updated.length > 0) {
+        summary.push(`Updated ${result.memories_updated.length} memories:`);
+        for (const m of result.memories_updated) {
+          summary.push(`  #${m.id}: ${m.content}`);
+        }
+      }
+      if (result.entities_added.length > 0) {
+        summary.push(`Added ${result.entities_added.length} entities:`);
+        for (const e of result.entities_added) {
+          summary.push(`  ${e.name} (${e.entity_type})`);
+        }
+      }
+      if (result.relationships_added.length > 0) {
+        summary.push(
+          `Added ${result.relationships_added.length} relationships`
+        );
+      }
+      if (result.skipped > 0) {
+        summary.push(`Skipped ${result.skipped} already-known facts`);
+      }
+      return summary.length > 0
+        ? summary.join("\n")
+        : "No new knowledge extracted.";
+    }
+
     case "graph_add_entity": {
       const result = await apiCall("POST", "/api/v1/entities", {
         name: args.name,
@@ -434,12 +524,30 @@ async function handleTool(name, args) {
         "GET",
         `/api/v1/entities/${entity.id}/relationships`
       );
-      return `Entity: ${entity.name} (${entity.entity_type})\n` +
+      return (
+        `Entity: ${entity.name} (${entity.entity_type})\n` +
         (entity.description ? `Description: ${entity.description}\n` : "") +
         `\nRelationships:\n` +
         rels
-          .map((r) => `  --${r[0].relation_type}--> ${r[1].name} (${r[1].entity_type})`)
-          .join("\n");
+          .map(
+            (r) =>
+              `  --${r[0].relation_type}--> ${r[1].name} (${r[1].entity_type})`
+          )
+          .join("\n")
+      );
+    }
+
+    case "graph_traverse": {
+      const result = await apiCall("POST", "/api/v1/graph/traverse", {
+        entity_id: args.entity_id,
+        depth: args.depth || 2,
+      });
+      return result
+        .map(
+          (entry) =>
+            `${entry[0].name} (${entry[0].entity_type}) — ${entry[1].length} relationship(s)`
+        )
+        .join("\n");
     }
 
     case "channel_create": {
@@ -458,6 +566,17 @@ async function handleTool(name, args) {
         shared_by: "mcp",
       });
       return `Memory #${args.memory_id} shared to channel #${args.channel_id}`;
+    }
+
+    case "channel_list": {
+      const channels = await apiCall("GET", "/api/v1/channels");
+      if (channels.length === 0) return "No channels.";
+      return channels
+        .map(
+          (ch) =>
+            `#${ch.id} ${ch.name} (${ch.channel_type}) — by ${ch.created_by}`
+        )
+        .join("\n");
     }
 
     case "agent_register": {
@@ -479,6 +598,20 @@ async function handleTool(name, args) {
             `${a.name} (${a.agent_type}) — ${a.status} — ${a.memory_count} memories`
         )
         .join("\n");
+    }
+
+    case "hivemind_status": {
+      const status = await apiCall("GET", "/api/v1/status");
+      return [
+        `Memories: ${status.memories} (${status.valid_memories} valid)`,
+        `Entities: ${status.entities}`,
+        `Relationships: ${status.relationships}`,
+        `Agents: ${status.agents}`,
+        `Embeddings indexed: ${status.embeddings_indexed}`,
+        `Embedding dimensions: ${status.embedding_dimensions}`,
+        `Extraction available: ${status.extraction_available}`,
+        `Replication enabled: ${status.replication_enabled}`,
+      ].join("\n");
     }
 
     default:

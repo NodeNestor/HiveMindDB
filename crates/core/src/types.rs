@@ -261,17 +261,6 @@ fn default_weight() -> f32 {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct GraphQueryRequest {
-    pub query: String,
-    #[serde(default = "default_depth")]
-    pub depth: usize,
-}
-
-fn default_depth() -> usize {
-    2
-}
-
-#[derive(Debug, Deserialize)]
 pub struct CreateChannelRequest {
     pub name: String,
     pub description: Option<String>,
@@ -302,14 +291,34 @@ pub struct RegisterAgentRequest {
 }
 
 // ============================================================================
+// Extraction Response Types
+// ============================================================================
+
+/// Response from the extraction pipeline endpoint.
+#[derive(Debug, Serialize)]
+pub struct ExtractResponse {
+    pub memories_added: Vec<Memory>,
+    pub memories_updated: Vec<Memory>,
+    pub entities_added: Vec<Entity>,
+    pub relationships_added: Vec<Relationship>,
+    pub skipped: usize,
+}
+
+// ============================================================================
 // WebSocket Message Types
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsClientMessage {
-    Subscribe { channels: Vec<String> },
-    Unsubscribe { channels: Vec<String> },
+    Subscribe {
+        channels: Vec<String>,
+        #[serde(default)]
+        agent_id: Option<String>,
+    },
+    Unsubscribe {
+        channels: Vec<String>,
+    },
     Ping,
 }
 

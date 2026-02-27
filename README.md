@@ -4,7 +4,7 @@
 
 ### Shared memory for AI agent swarms.
 
-Distributed, fault-tolerant memory system for AI agents — knowledge graphs, semantic search, and real-time hivemind channels, all replicated via Raft consensus.
+Distributed, fault-tolerant memory system for AI agents — knowledge graphs, semantic search, LLM extraction, real-time hivemind channels, all replicated via Raft consensus.
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org)
@@ -46,6 +46,15 @@ HIVEMINDDB_URL=http://hivemind-1:8100
 MEMORY_PROVIDER=hiveminddb
 ```
 
+### With CodeGate Proxy
+
+```bash
+# Use CodeGate as the LLM provider for extraction
+HIVEMIND_LLM_PROVIDER=codegate  # Uses http://localhost:9212/v1
+# Or point at your CodeGate instance directly:
+HIVEMIND_LLM_PROVIDER=http://codegate:9212/v1
+```
+
 ### What Your Agent Can Do
 
 ```
@@ -56,6 +65,17 @@ MEMORY_PROVIDER=hiveminddb
 Found 1 result:
   #1 [score: 0.95] User prefers Rust over Python for new projects
      tags: preferences
+
+> Extract knowledge from this conversation
+Added 3 memories:
+  #2: User is building RaftTimeDB
+  #3: User prefers dark mode
+  #4: User works with SpacetimeDB
+Added 2 entities:
+  RaftTimeDB (Project)
+  SpacetimeDB (Technology)
+Added 1 relationship:
+  RaftTimeDB --uses--> SpacetimeDB
 
 > Who maintains RaftTimeDB?
 Entity: ludde (Person)
@@ -69,14 +89,19 @@ Entity: ludde (Person)
 |---------|-------------|
 | **Persistent Memory** | Facts, preferences, and knowledge survive across sessions |
 | **Knowledge Graph** | Entities + typed relationships with graph traversal |
+| **Hybrid Search** | Keyword + vector similarity search (OpenAI/Ollama/CodeGate embeddings) |
+| **LLM Extraction** | Automatically extract facts, entities, and relationships from conversations |
 | **Bi-Temporal** | Old facts are invalidated, not deleted — query "what did we know last Tuesday?" |
-| **Hivemind Channels** | Agents subscribe to channels, get real-time updates when any agent learns something |
-| **Conflict Resolution** | New facts that contradict old ones trigger temporal invalidation |
+| **Hivemind Channels** | Agents subscribe to channels, get real-time WebSocket updates |
+| **Conflict Resolution** | LLM determines ADD/UPDATE/NOOP for new facts vs existing knowledge |
 | **Full Audit Trail** | Every memory change is recorded — who changed what, when, and why |
-| **MCP Native** | Drop-in MCP server for Claude Code, OpenCode, Aider |
+| **Snapshot Persistence** | Periodic JSON snapshots to disk, auto-restore on restart |
+| **Raft Replication** | Optional RaftTimeDB replication for multi-node fault tolerance |
+| **MCP Native** | Drop-in MCP server for Claude Code, OpenCode, Aider (20 tools) |
 | **AgentCore Compatible** | Same `remember`/`recall`/`forget`/`search` interface |
-| **Fault Tolerant** | Built on RaftTimeDB — kill a node, the hivemind keeps thinking |
+| **CodeGate Support** | Use your CodeGate proxy for LLM and embedding calls |
 | **REST + WebSocket API** | Works with any HTTP client or agent framework |
+| **Graceful Shutdown** | Ctrl+C saves final snapshot, drains connections cleanly |
 
 ## Architecture
 
@@ -89,8 +114,10 @@ Entity: ludde (Person)
 ┌──────────────────▼──────────────────────────┐
 │           HiveMindDB Sidecar                │
 │  Memory Engine · Knowledge Graph · Channels │
+│  LLM Extraction · Vector Embeddings         │
+│  Snapshot Persistence · Replication Client   │
 └──────────────────┬──────────────────────────┘
-                   │ WebSocket
+                   │ WebSocket (replication)
 ┌──────────────────▼──────────────────────────┐
 │        RaftTimeDB (Raft Consensus)          │
 │  Multi-shard · Leader forwarding · TLS      │
@@ -105,9 +132,11 @@ Entity: ludde (Person)
 ## CLI
 
 ```bash
-hmdb status                                    # Cluster stats
+hmdb status                                    # Cluster stats + embedding/extraction info
 hmdb add "User prefers Rust" --user ludde     # Add a memory
-hmdb search "what does the user prefer?"      # Search
+hmdb search "what does the user prefer?"      # Hybrid search
+hmdb extract "User said they prefer Rust"     # LLM extraction
+hmdb extract --file conversation.json          # Extract from conversation file
 hmdb entity "RaftTimeDB"                       # Entity + relationships
 hmdb traverse 1 --depth 3                      # Graph traversal
 hmdb history 42                                # Audit trail
@@ -116,24 +145,77 @@ hmdb channels                                  # List channels
 hmdb agents                                    # List agents
 ```
 
+## MCP Tools (20 tools)
+
+### AgentCore-Compatible (drop-in replacement)
+
+| Tool | Description |
+|------|-------------|
+| `remember` | Store memory under a topic |
+| `recall` | Recall all memories for a topic |
+| `forget` | Invalidate all memories for a topic |
+| `search` | Hybrid search (keyword + vector) |
+| `list_topics` | List topics with counts |
+
+### Extended HiveMindDB Tools
+
+| Tool | Description |
+|------|-------------|
+| `memory_add` | Add memory with full metadata |
+| `memory_search` | Hybrid search with filters |
+| `memory_history` | Full audit trail |
+| `extract` | LLM knowledge extraction from conversation |
+| `graph_add_entity` | Add knowledge graph entity |
+| `graph_add_relation` | Create entity relationship |
+| `graph_query` | Find entity + relationships |
+| `graph_traverse` | Graph traversal from entity |
+| `channel_create` | Create hivemind channel |
+| `channel_share` | Share memory to channel |
+| `channel_list` | List all channels |
+| `agent_register` | Register agent in hivemind |
+| `agent_status` | List agents + status |
+| `hivemind_status` | Full cluster status |
+
 ## API
 
 Full REST API at `http://localhost:8100/api/v1/`:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/memories` | POST | Add memory |
+| `/memories` | POST/GET | Add/list memories |
 | `/memories/:id` | GET/PUT/DELETE | Get, update, invalidate |
 | `/memories/:id/history` | GET | Audit trail |
-| `/search` | POST | Semantic search |
+| `/search` | POST | Hybrid search (keyword + vector) |
+| `/extract` | POST | LLM knowledge extraction |
 | `/entities` | POST | Add entity |
+| `/entities/:id` | GET | Get entity |
+| `/entities/find` | POST | Find by name |
 | `/entities/:id/relationships` | GET | Entity relationships |
+| `/relationships` | POST | Add relationship |
 | `/graph/traverse` | POST | Graph traversal |
 | `/channels` | POST/GET | Create/list channels |
 | `/channels/:id/share` | POST | Share memory to channel |
 | `/agents/register` | POST | Register agent |
 | `/agents` | GET | List agents |
+| `/agents/:id/heartbeat` | POST | Agent heartbeat |
 | `/status` | GET | Cluster stats |
+
+WebSocket at `ws://localhost:8100/ws` for real-time channel subscriptions.
+
+## Configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `HIVEMIND_LISTEN_ADDR` | `0.0.0.0:8100` | API address |
+| `HIVEMIND_RTDB_URL` | `ws://127.0.0.1:3001` | RaftTimeDB URL |
+| `HIVEMIND_LLM_PROVIDER` | `anthropic` | LLM provider (openai/anthropic/ollama/codegate/URL) |
+| `HIVEMIND_LLM_API_KEY` | - | LLM API key |
+| `HIVEMIND_LLM_MODEL` | `claude-sonnet-4-20250514` | LLM model |
+| `HIVEMIND_EMBEDDING_MODEL` | `openai:text-embedding-3-small` | Embedding model |
+| `HIVEMIND_EMBEDDING_API_KEY` | - | Embedding API key |
+| `HIVEMIND_DATA_DIR` | `./data` | Snapshot directory |
+| `HIVEMIND_SNAPSHOT_INTERVAL` | `60` | Snapshot interval (seconds) |
+| `HIVEMIND_ENABLE_REPLICATION` | `false` | Enable Raft replication |
 
 ## License
 
