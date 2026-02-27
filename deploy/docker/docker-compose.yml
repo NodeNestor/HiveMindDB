@@ -1,0 +1,123 @@
+# HiveMindDB — Standalone 3-node cluster for development
+#
+# Usage:
+#   docker compose up -d
+#   curl http://localhost:8100/api/v1/status
+#
+# Ports:
+#   8100-8102: HiveMindDB API (connect agents here)
+#   3001-3003: RaftTimeDB WebSocket proxy
+#   4001-4003: RaftTimeDB management API
+
+version: "3.8"
+
+services:
+  # === SpacetimeDB Instances ===
+  stdb-1:
+    image: clockworklabs/spacetime:latest
+    command: ["spacetimedb-standalone", "start", "--listen-addr", "0.0.0.0:3000"]
+    volumes:
+      - stdb1-data:/app/data
+
+  stdb-2:
+    image: clockworklabs/spacetime:latest
+    command: ["spacetimedb-standalone", "start", "--listen-addr", "0.0.0.0:3000"]
+    volumes:
+      - stdb2-data:/app/data
+
+  stdb-3:
+    image: clockworklabs/spacetime:latest
+    command: ["spacetimedb-standalone", "start", "--listen-addr", "0.0.0.0:3000"]
+    volumes:
+      - stdb3-data:/app/data
+
+  # === RaftTimeDB Consensus Layer ===
+  rtdb-1:
+    image: ghcr.io/nodenestor/rafttimedb:latest
+    environment:
+      RTDB_NODE_ID: "1"
+      RTDB_RAFT_ADDR: "0.0.0.0:4001"
+      RTDB_LISTEN_ADDR: "0.0.0.0:3001"
+      RTDB_STDB_URL: "ws://stdb-1:3000"
+      RTDB_PEERS: "2=rtdb-2:4001,3=rtdb-3:4001"
+      RTDB_DATA_DIR: "/data"
+    ports:
+      - "3001:3001"
+      - "4001:4001"
+    depends_on: [stdb-1]
+    volumes:
+      - rtdb1-data:/data
+
+  rtdb-2:
+    image: ghcr.io/nodenestor/rafttimedb:latest
+    environment:
+      RTDB_NODE_ID: "2"
+      RTDB_RAFT_ADDR: "0.0.0.0:4001"
+      RTDB_LISTEN_ADDR: "0.0.0.0:3001"
+      RTDB_STDB_URL: "ws://stdb-2:3000"
+      RTDB_PEERS: "1=rtdb-1:4001,3=rtdb-3:4001"
+      RTDB_DATA_DIR: "/data"
+    ports:
+      - "3002:3001"
+      - "4002:4001"
+    depends_on: [stdb-2]
+    volumes:
+      - rtdb2-data:/data
+
+  rtdb-3:
+    image: ghcr.io/nodenestor/rafttimedb:latest
+    environment:
+      RTDB_NODE_ID: "3"
+      RTDB_RAFT_ADDR: "0.0.0.0:4001"
+      RTDB_LISTEN_ADDR: "0.0.0.0:3001"
+      RTDB_STDB_URL: "ws://stdb-3:3000"
+      RTDB_PEERS: "1=rtdb-1:4001,2=rtdb-2:4001"
+      RTDB_DATA_DIR: "/data"
+    ports:
+      - "3003:3001"
+      - "4003:4001"
+    depends_on: [stdb-3]
+    volumes:
+      - rtdb3-data:/data
+
+  # === HiveMindDB Sidecar (memory engine + API) ===
+  hivemind-1:
+    image: hiveminddb:latest
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    environment:
+      HIVEMIND_LISTEN_ADDR: "0.0.0.0:8100"
+      HIVEMIND_RTDB_URL: "ws://rtdb-1:3001"
+      HIVEMIND_DATA_DIR: "/data"
+    ports:
+      - "8100:8100"
+    depends_on: [rtdb-1]
+
+  hivemind-2:
+    image: hiveminddb:latest
+    environment:
+      HIVEMIND_LISTEN_ADDR: "0.0.0.0:8100"
+      HIVEMIND_RTDB_URL: "ws://rtdb-2:3001"
+      HIVEMIND_DATA_DIR: "/data"
+    ports:
+      - "8101:8100"
+    depends_on: [rtdb-2]
+
+  hivemind-3:
+    image: hiveminddb:latest
+    environment:
+      HIVEMIND_LISTEN_ADDR: "0.0.0.0:8100"
+      HIVEMIND_RTDB_URL: "ws://rtdb-3:3001"
+      HIVEMIND_DATA_DIR: "/data"
+    ports:
+      - "8102:8100"
+    depends_on: [rtdb-3]
+
+volumes:
+  stdb1-data:
+  stdb2-data:
+  stdb3-data:
+  rtdb1-data:
+  rtdb2-data:
+  rtdb3-data:

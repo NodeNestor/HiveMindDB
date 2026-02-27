@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+.env
+*.db
+*.redb
+node_modules/
+dist/
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
