@@ -1,0 +1,12 @@
+[package]
+name = "hivemind-module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spacetimedb = "1.0"
+log = "0.4"

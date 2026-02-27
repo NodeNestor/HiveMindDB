@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/cli",
+]
+# The SpacetimeDB module is built separately with `spacetime publish`
+# (it targets wasm32, not the host platform)
+exclude = ["module"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/NodeNestor/HiveMindDB"

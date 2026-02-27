@@ -1,0 +1,14 @@
+{
+  "_comment": "Add this entry to AgentCore's mcp-tools/library.json under mcpServers",
+  "hiveminddb": {
+    "name": "HiveMindDB",
+    "description": "Distributed agent memory: remember, recall, search, knowledge graph, hivemind channels — replicated across cluster nodes",
+    "command": "npx",
+    "args": ["hiveminddb-mcp", "--url", "${HIVEMINDDB_URL}"],
+    "builtIn": false,
+    "requiresDesktop": false,
+    "category": "memory",
+    "default": false,
+    "requiredEnv": ["HIVEMINDDB_URL"]
+  }
+}
