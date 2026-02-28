@@ -108,6 +108,7 @@ struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     temperature: f32,
+    max_tokens: u32,
     response_format: Option<ResponseFormat>,
 }
 
@@ -291,6 +292,7 @@ impl ExtractionPipeline {
                 },
             ],
             temperature: 0.1,
+            max_tokens: 4096,
             response_format: Some(ResponseFormat {
                 format_type: "json_object".into(),
             }),
