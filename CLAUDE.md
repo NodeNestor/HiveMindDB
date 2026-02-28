@@ -60,6 +60,7 @@ cd crates/mcp-server && npm install  # Install MCP server deps
 - **Provider-agnostic**: LLM and embedding calls work with any OpenAI-compatible API, including CodeGate proxy, Ollama local models, and custom URLs.
 - **Docker glibc**: ONNX Runtime (via fastembed) needs glibc 2.38+. Builder uses `rust:latest`, runtime uses `debian:trixie-slim`. The `/data` directory must be writable by the `hivemind` user for model caching.
 - **MCP-first**: Primary interface is MCP tools (drop-in compatible with AgentCore's agent-memory).
+- **Auto-memory hooks**: AgentCore installs Claude Code hooks that auto-register agents, inject relevant memories via semantic search (RAG), and track file changes — zero manual `remember` calls needed.
 - **AgentCore-compatible**: Implements remember/recall/forget/search/list_topics matching AgentCore's existing interface.
 - **Bi-temporal**: Memories have valid_from/valid_until — old facts are invalidated, never deleted.
 - **Channel pub/sub**: Agents subscribe to channels and get real-time pushes via broadcast::channel + WebSocket.
