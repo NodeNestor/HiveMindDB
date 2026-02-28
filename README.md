@@ -62,22 +62,100 @@ cargo install --path crates/core    # hiveminddb server
 cargo install --path crates/cli     # hmdb CLI
 ```
 
-### With Claude Code
+### With Claude Code (standalone)
 
 ```bash
+# Start HiveMindDB locally
+hiveminddb --listen-addr 0.0.0.0:8100
+
 # Add MCP server to Claude Code
 claude mcp add hivemind -- npx hiveminddb-mcp --url http://localhost:8100
 
-# Done. Claude Code now has persistent, searchable memory.
+# Done. Claude Code now has 20 memory tools: remember, recall, search, extract, etc.
 ```
 
-### With AgentCore
+### With Claude Code (auto-memory hooks)
+
+For fully automatic memory — no manual `remember` calls needed:
 
 ```bash
-# Add to your .env
-HIVEMINDDB_URL=http://hivemind-1:8100
+# 1. Add MCP server
+claude mcp add hivemind -- npx hiveminddb-mcp --url http://localhost:8100
+
+# 2. Install hooks (copy from AgentCore or create manually)
+mkdir -p ~/.claude/hooks/hivemind
+# Download hook scripts from:
+#   https://github.com/NodeNestor/AgentCore/tree/main/hooks/hivemind
+
+# 3. Add to ~/.claude/settings.json:
+```
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "startup",
+      "hooks": [{
+        "type": "command",
+        "command": "~/.claude/hooks/hivemind/session-start.sh",
+        "timeout": 10
+      }]
+    }],
+    "UserPromptSubmit": [{
+      "matcher": "",
+      "hooks": [{
+        "type": "command",
+        "command": "~/.claude/hooks/hivemind/prompt-search.sh",
+        "timeout": 5
+      }]
+    }],
+    "PostToolUse": [{
+      "matcher": "Edit|Write",
+      "hooks": [{
+        "type": "command",
+        "command": "~/.claude/hooks/hivemind/track-changes.sh",
+        "timeout": 5,
+        "async": true
+      }]
+    }],
+    "Stop": [{
+      "matcher": "",
+      "hooks": [{
+        "type": "command",
+        "command": "~/.claude/hooks/hivemind/session-stop.sh",
+        "timeout": 5,
+        "async": true
+      }]
+    }]
+  }
+}
+```
+
+**What the hooks do:**
+
+| Hook | Event | Effect |
+|------|-------|--------|
+| `session-start.sh` | Session starts | Registers agent, recalls recent memories, injects as context |
+| `prompt-search.sh` | User submits prompt | Semantic search → injects relevant memories (RAG) |
+| `track-changes.sh` | File edited/written | Logs file change as memory (async, non-blocking) |
+| `session-stop.sh` | Claude stops | Sends heartbeat (async, non-blocking) |
+
+Required env vars: `HIVEMINDDB_URL`, `AGENT_ID`, `AGENT_NAME`
+
+### With AgentCore (zero config)
+
+AgentCore auto-installs hooks and MCP tools when `HIVEMINDDB_URL` is set:
+
+```bash
+# Add to your docker-compose.yml or .env
+HIVEMINDDB_URL=http://hivemind:8100
 MEMORY_PROVIDER=hiveminddb
 ```
+
+That's it. The entrypoint module `52-memory-hooks.sh` handles everything:
+- Copies hook scripts to the agent
+- Merges hook config into `settings.json`
+- MCP tools auto-discovered from `library.json`
 
 ### With CodeGate Proxy
 
