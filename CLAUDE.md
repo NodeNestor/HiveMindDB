@@ -58,6 +58,7 @@ cd crates/mcp-server && npm install  # Install MCP server deps
 - **Hybrid search**: Combines keyword matching with vector similarity. Local embeddings enabled by default via `fastembed` (ONNX Runtime, CPU-only, 22M param model). Also supports external APIs (OpenAI, Ollama, CodeGate). Falls back to keyword-only when embeddings are disabled.
 - **LLM extraction**: Sends conversation text to an LLM (OpenAI/Anthropic/Ollama/CodeGate) to extract facts, entities, and relationships. Handles conflict resolution (ADD/UPDATE/NOOP).
 - **Provider-agnostic**: LLM and embedding calls work with any OpenAI-compatible API, including CodeGate proxy, Ollama local models, and custom URLs.
+- **Docker glibc**: ONNX Runtime (via fastembed) needs glibc 2.38+. Builder uses `rust:latest`, runtime uses `debian:trixie-slim`. The `/data` directory must be writable by the `hivemind` user for model caching.
 - **MCP-first**: Primary interface is MCP tools (drop-in compatible with AgentCore's agent-memory).
 - **AgentCore-compatible**: Implements remember/recall/forget/search/list_topics matching AgentCore's existing interface.
 - **Bi-temporal**: Memories have valid_from/valid_until — old facts are invalidated, never deleted.
