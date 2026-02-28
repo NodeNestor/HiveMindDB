@@ -92,29 +92,34 @@ mkdir -p ~/.claude/hooks/hivemind
 
 ```json
 {
+  "env": {
+    "HIVEMINDDB_URL": "http://localhost:8100",
+    "AGENT_ID": "my-claude",
+    "AGENT_NAME": "My Local Claude"
+  },
   "hooks": {
     "SessionStart": [{
-      "matcher": "startup",
+      "matcher": "",
       "hooks": [{
         "type": "command",
-        "command": "~/.claude/hooks/hivemind/session-start.sh",
-        "timeout": 10
+        "command": "bash ~/.claude/hooks/hivemind/session-start.sh",
+        "timeout": 10000
       }]
     }],
     "UserPromptSubmit": [{
       "matcher": "",
       "hooks": [{
         "type": "command",
-        "command": "~/.claude/hooks/hivemind/prompt-search.sh",
-        "timeout": 5
+        "command": "bash ~/.claude/hooks/hivemind/prompt-search.sh",
+        "timeout": 5000
       }]
     }],
     "PostToolUse": [{
       "matcher": "Edit|Write",
       "hooks": [{
         "type": "command",
-        "command": "~/.claude/hooks/hivemind/track-changes.sh",
-        "timeout": 5,
+        "command": "bash ~/.claude/hooks/hivemind/track-changes.sh",
+        "timeout": 5000,
         "async": true
       }]
     }],
@@ -122,14 +127,16 @@ mkdir -p ~/.claude/hooks/hivemind
       "matcher": "",
       "hooks": [{
         "type": "command",
-        "command": "~/.claude/hooks/hivemind/session-stop.sh",
-        "timeout": 5,
+        "command": "bash ~/.claude/hooks/hivemind/session-stop.sh",
+        "timeout": 5000,
         "async": true
       }]
     }]
   }
 }
 ```
+
+> **Note:** Timeouts are in milliseconds. On Windows, prefix commands with `bash` (e.g. `bash ~/.claude/hooks/hivemind/session-start.sh`). Requires `curl` and `jq` on your PATH.
 
 **What the hooks do:**
 
