@@ -39,8 +39,8 @@ struct Cli {
     #[arg(long, default_value = "claude-sonnet-4-20250514", env = "HIVEMIND_LLM_MODEL")]
     llm_model: String,
 
-    /// Embedding model (provider:model, e.g. openai:text-embedding-3-small, ollama:nomic-embed-text)
-    #[arg(long, default_value = "openai:text-embedding-3-small", env = "HIVEMIND_EMBEDDING_MODEL")]
+    /// Embedding model (provider:model, e.g. local:all-MiniLM-L6-v2, openai:text-embedding-3-small)
+    #[arg(long, default_value = "local:all-MiniLM-L6-v2", env = "HIVEMIND_EMBEDDING_MODEL")]
     embedding_model: String,
 
     /// Embedding API key (if different from LLM key)

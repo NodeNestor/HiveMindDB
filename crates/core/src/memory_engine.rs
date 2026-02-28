@@ -828,7 +828,7 @@ mod tests {
             llm_provider: "test".into(),
             llm_api_key: None,
             llm_model: "test".into(),
-            embedding_model: "test".into(),
+            embedding_model: "none:disabled".into(),
             embedding_api_key: None,
             data_dir: "/tmp/hivemind-test".into(),
         }

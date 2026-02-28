@@ -3,12 +3,17 @@ use crate::types::*;
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 /// Vector embedding engine for semantic search.
 ///
-/// Generates embeddings via external APIs (OpenAI, Ollama, CodeGate, etc.),
-/// caches them in-memory, and provides cosine similarity search.
+/// Supports two backends:
+/// - **Local** (default): In-process ONNX model via `fastembed` — no external API needed.
+///   Uses all-MiniLM-L6-v2 (22M params, 384 dims) by default. CPU-only, ~22MB model.
+/// - **API**: External embedding APIs (OpenAI, Ollama, CodeGate, etc.)
+///
+/// Caches embeddings in-memory and provides cosine similarity search.
 pub struct EmbeddingEngine {
     client: Client,
     config: EmbeddingConfig,
@@ -16,6 +21,9 @@ pub struct EmbeddingEngine {
     vectors: DashMap<u64, Vec<f32>>,
     /// Dimensionality (set after first embedding)
     dimensions: std::sync::atomic::AtomicU32,
+    /// Local ONNX embedding model (when provider = "local")
+    #[cfg(feature = "local-embeddings")]
+    local_model: Option<Arc<std::sync::Mutex<fastembed::TextEmbedding>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -25,18 +33,29 @@ pub struct EmbeddingConfig {
     pub api_key: Option<String>,
     pub base_url: String,
     pub dimensions: Option<u32>,
+    pub cache_dir: Option<String>,
 }
 
 impl EmbeddingConfig {
     pub fn from_hivemind_config(config: &HiveMindConfig) -> Self {
         // Parse "provider:model" format, e.g. "openai:text-embedding-3-small"
+        // or "local:all-MiniLM-L6-v2"
         let (provider, model) = if let Some((p, m)) = config.embedding_model.split_once(':') {
             (p.to_string(), m.to_string())
         } else {
-            ("openai".to_string(), config.embedding_model.clone())
+            // No prefix — default to "local" with the value as the model name
+            #[cfg(feature = "local-embeddings")]
+            {
+                ("local".to_string(), config.embedding_model.clone())
+            }
+            #[cfg(not(feature = "local-embeddings"))]
+            {
+                ("openai".to_string(), config.embedding_model.clone())
+            }
         };
 
         let base_url = match provider.as_str() {
+            "local" => String::new(),
             "openai" => "https://api.openai.com/v1".into(),
             "ollama" => "http://localhost:11434/v1".into(),
             "codegate" => "http://localhost:9212/v1".into(),
@@ -55,6 +74,7 @@ impl EmbeddingConfig {
             api_key,
             base_url,
             dimensions: None,
+            cache_dir: Some(format!("{}/embeddings", config.data_dir)),
         }
     }
 }
@@ -77,13 +97,118 @@ struct EmbeddingData {
     embedding: Vec<f32>,
 }
 
+/// Map user-friendly model names to fastembed enum variants.
+#[cfg(feature = "local-embeddings")]
+fn resolve_local_model(name: &str) -> fastembed::EmbeddingModel {
+    match name {
+        // MiniLM family (tiny, fast, great quality for size)
+        "all-MiniLM-L6-v2" | "AllMiniLML6V2" | "minilm" => {
+            fastembed::EmbeddingModel::AllMiniLML6V2
+        }
+        "all-MiniLM-L6-v2-q" | "AllMiniLML6V2Q" | "minilm-q" => {
+            fastembed::EmbeddingModel::AllMiniLML6V2Q
+        }
+        "all-MiniLM-L12-v2" | "AllMiniLML12V2" => fastembed::EmbeddingModel::AllMiniLML12V2,
+        "all-MiniLM-L12-v2-q" | "AllMiniLML12V2Q" => fastembed::EmbeddingModel::AllMiniLML12V2Q,
+
+        // BGE family
+        "bge-small-en-v1.5" | "BGESmallENV15" | "bge-small" => {
+            fastembed::EmbeddingModel::BGESmallENV15
+        }
+        "bge-base-en-v1.5" | "BGEBaseENV15" | "bge-base" => {
+            fastembed::EmbeddingModel::BGEBaseENV15
+        }
+        "bge-large-en-v1.5" | "BGELargeENV15" | "bge-large" => {
+            fastembed::EmbeddingModel::BGELargeENV15
+        }
+        "bge-m3" | "BGEM3" => fastembed::EmbeddingModel::BGEM3,
+
+        // Snowflake Arctic (small + fast)
+        "snowflake-arctic-embed-xs" | "arctic-xs" => {
+            fastembed::EmbeddingModel::SnowflakeArcticEmbedXS
+        }
+        "snowflake-arctic-embed-s" | "arctic-s" => {
+            fastembed::EmbeddingModel::SnowflakeArcticEmbedS
+        }
+        "snowflake-arctic-embed-m" | "arctic-m" => {
+            fastembed::EmbeddingModel::SnowflakeArcticEmbedM
+        }
+
+        // Nomic
+        "nomic-embed-text-v1.5" | "nomic-v1.5" => fastembed::EmbeddingModel::NomicEmbedTextV15,
+        "nomic-embed-text-v1" | "nomic-v1" => fastembed::EmbeddingModel::NomicEmbedTextV1,
+
+        // GTE
+        "gte-base-en-v1.5" | "gte-base" => fastembed::EmbeddingModel::GTEBaseENV15,
+        "gte-large-en-v1.5" | "gte-large" => fastembed::EmbeddingModel::GTELargeENV15,
+
+        // Multilingual E5
+        "multilingual-e5-small" | "e5-small" => fastembed::EmbeddingModel::MultilingualE5Small,
+        "multilingual-e5-base" | "e5-base" => fastembed::EmbeddingModel::MultilingualE5Base,
+
+        // Jina (code-aware)
+        "jina-embeddings-v2-base-code" | "jina-code" => {
+            fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode
+        }
+        "jina-embeddings-v2-base-en" | "jina-en" => {
+            fastembed::EmbeddingModel::JinaEmbeddingsV2BaseEN
+        }
+
+        // Google EmbeddingGemma
+        "embedding-gemma-300m" | "gemma-300m" => fastembed::EmbeddingModel::EmbeddingGemma300M,
+
+        // Default: all-MiniLM-L6-v2 (22M params, 384 dims — best balance)
+        _ => {
+            warn!(
+                model = name,
+                "Unknown local embedding model, defaulting to all-MiniLM-L6-v2"
+            );
+            fastembed::EmbeddingModel::AllMiniLML6V2
+        }
+    }
+}
+
 impl EmbeddingEngine {
     pub fn new(config: EmbeddingConfig) -> Self {
+        #[cfg(feature = "local-embeddings")]
+        let local_model = if config.provider == "local" {
+            let model_enum = resolve_local_model(&config.model);
+
+            let mut init = fastembed::InitOptions::new(model_enum)
+                .with_show_download_progress(true);
+
+            if let Some(ref cache_dir) = config.cache_dir {
+                init = init.with_cache_dir(std::path::PathBuf::from(cache_dir));
+            }
+
+            match fastembed::TextEmbedding::try_new(init) {
+                Ok(model) => {
+                    info!(
+                        model = %config.model,
+                        "Local embedding model loaded (in-process ONNX, CPU-only)"
+                    );
+                    Some(Arc::new(std::sync::Mutex::new(model)))
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        model = %config.model,
+                        "Failed to load local embedding model — embeddings disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             client: Client::new(),
             config,
             vectors: DashMap::new(),
             dimensions: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "local-embeddings")]
+            local_model,
         }
     }
 
@@ -91,8 +216,13 @@ impl EmbeddingEngine {
         Self::new(EmbeddingConfig::from_hivemind_config(config))
     }
 
-    /// Check if the embedding engine is configured (has an API key or is using a local provider).
+    /// Check if the embedding engine is configured and ready.
     pub fn is_available(&self) -> bool {
+        #[cfg(feature = "local-embeddings")]
+        if self.local_model.is_some() {
+            return true;
+        }
+
         self.config.api_key.is_some()
             || self.config.base_url.contains("localhost")
             || self.config.base_url.contains("127.0.0.1")
@@ -107,12 +237,55 @@ impl EmbeddingEngine {
             .ok_or_else(|| anyhow::anyhow!("Empty embedding response"))
     }
 
-    /// Generate embeddings for multiple texts in a single API call.
+    /// Generate embeddings for multiple texts.
+    ///
+    /// Uses local ONNX model when available, otherwise falls back to external API.
     pub async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
+        // Try local model first
+        #[cfg(feature = "local-embeddings")]
+        if let Some(ref model) = self.local_model {
+            return self.embed_local(model, texts).await;
+        }
+
+        // Fall back to external API
+        self.embed_api(texts).await
+    }
+
+    /// Embed using local ONNX model (runs on blocking thread pool).
+    #[cfg(feature = "local-embeddings")]
+    async fn embed_local(
+        &self,
+        model: &Arc<std::sync::Mutex<fastembed::TextEmbedding>>,
+        texts: &[String],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let model = model.clone();
+        let texts = texts.to_vec();
+
+        let embeddings = tokio::task::spawn_blocking(move || {
+            let mut model = model.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+            model
+                .embed(texts, None)
+                .map_err(|e| anyhow::anyhow!("Local embedding failed: {}", e))
+        })
+        .await??;
+
+        // Track dimensions
+        if let Some(first) = embeddings.first() {
+            self.dimensions.store(
+                first.len() as u32,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        Ok(embeddings)
+    }
+
+    /// Embed using external OpenAI-compatible API.
+    async fn embed_api(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
         let url = format!("{}/embeddings", self.config.base_url);
 
         let req = EmbeddingRequest {
@@ -221,6 +394,16 @@ impl EmbeddingEngine {
     pub fn is_indexed(&self, memory_id: u64) -> bool {
         self.vectors.contains_key(&memory_id)
     }
+
+    /// Get the provider name for status reporting.
+    pub fn provider(&self) -> &str {
+        &self.config.provider
+    }
+
+    /// Get the model name for status reporting.
+    pub fn model(&self) -> &str {
+        &self.config.model
+    }
 }
 
 /// Cosine similarity between two vectors.
@@ -319,6 +502,7 @@ mod tests {
             api_key: None,
             base_url: "http://localhost:1234".into(),
             dimensions: Some(3),
+            cache_dir: None,
         });
 
         // Manually insert some vectors
@@ -352,7 +536,7 @@ mod tests {
             llm_model: "gpt-4o".into(),
             embedding_model: "openai:text-embedding-3-small".into(),
             embedding_api_key: None,
-            data_dir: "".into(),
+            data_dir: "./data".into(),
         };
         let ec = EmbeddingConfig::from_hivemind_config(&config);
         assert_eq!(ec.provider, "openai");
@@ -372,13 +556,51 @@ mod tests {
             llm_model: "llama3".into(),
             embedding_model: "ollama:nomic-embed-text".into(),
             embedding_api_key: None,
-            data_dir: "".into(),
+            data_dir: "./data".into(),
         };
         let ec = EmbeddingConfig::from_hivemind_config(&config);
         assert_eq!(ec.provider, "ollama");
         assert_eq!(ec.model, "nomic-embed-text");
         assert_eq!(ec.base_url, "http://localhost:11434/v1");
         assert!(ec.api_key.is_none());
+    }
+
+    #[test]
+    fn test_embedding_config_local_explicit() {
+        let config = HiveMindConfig {
+            listen_addr: "".into(),
+            rtdb_url: "".into(),
+            llm_provider: "openai".into(),
+            llm_api_key: None,
+            llm_model: "gpt-4o".into(),
+            embedding_model: "local:all-MiniLM-L6-v2".into(),
+            embedding_api_key: None,
+            data_dir: "/data".into(),
+        };
+        let ec = EmbeddingConfig::from_hivemind_config(&config);
+        assert_eq!(ec.provider, "local");
+        assert_eq!(ec.model, "all-MiniLM-L6-v2");
+        assert_eq!(ec.base_url, "");
+        assert_eq!(ec.cache_dir, Some("/data/embeddings".to_string()));
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    fn test_embedding_config_local_default() {
+        // No provider prefix → defaults to "local" when feature is enabled
+        let config = HiveMindConfig {
+            listen_addr: "".into(),
+            rtdb_url: "".into(),
+            llm_provider: "openai".into(),
+            llm_api_key: None,
+            llm_model: "gpt-4o".into(),
+            embedding_model: "all-MiniLM-L6-v2".into(),
+            embedding_api_key: None,
+            data_dir: "./data".into(),
+        };
+        let ec = EmbeddingConfig::from_hivemind_config(&config);
+        assert_eq!(ec.provider, "local");
+        assert_eq!(ec.model, "all-MiniLM-L6-v2");
     }
 
     #[test]
@@ -389,6 +611,7 @@ mod tests {
             api_key: None,
             base_url: "http://localhost:1234".into(),
             dimensions: None,
+            cache_dir: None,
         });
 
         assert_eq!(engine.indexed_count(), 0);
@@ -399,5 +622,35 @@ mod tests {
 
         engine.remove_memory(1);
         assert_eq!(engine.indexed_count(), 0);
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    fn test_resolve_local_model_variants() {
+        use fastembed::EmbeddingModel;
+
+        // Known names
+        assert!(matches!(
+            resolve_local_model("all-MiniLM-L6-v2"),
+            EmbeddingModel::AllMiniLML6V2
+        ));
+        assert!(matches!(
+            resolve_local_model("minilm"),
+            EmbeddingModel::AllMiniLML6V2
+        ));
+        assert!(matches!(
+            resolve_local_model("bge-small"),
+            EmbeddingModel::BGESmallENV15
+        ));
+        assert!(matches!(
+            resolve_local_model("jina-code"),
+            EmbeddingModel::JinaEmbeddingsV2BaseCode
+        ));
+
+        // Unknown → default
+        assert!(matches!(
+            resolve_local_model("nonexistent-model"),
+            EmbeddingModel::AllMiniLML6V2
+        ));
     }
 }

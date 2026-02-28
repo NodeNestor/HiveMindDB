@@ -9,10 +9,15 @@ default-run = "hiveminddb"
 name = "hiveminddb"
 path = "src/main.rs"
 
+[features]
+default = ["local-embeddings"]
+local-embeddings = ["dep:fastembed"]
+
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
+fastembed = { version = "5", optional = true }
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }

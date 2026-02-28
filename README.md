@@ -122,7 +122,7 @@ Entity: ludde (Person)
 |---------|-------------|
 | **Persistent Memory** | Facts, preferences, and knowledge survive across sessions |
 | **Knowledge Graph** | Entities + typed relationships with graph traversal |
-| **Hybrid Search** | Keyword + vector similarity search (OpenAI/Ollama/CodeGate embeddings) |
+| **Hybrid Search** | Keyword + vector similarity — local embeddings by default (22M param ONNX model, CPU-only, zero config) |
 | **LLM Extraction** | Automatically extract facts, entities, and relationships from conversations |
 | **Bi-Temporal** | Old facts are invalidated, not deleted — query "what did we know last Tuesday?" |
 | **Hivemind Channels** | Agents subscribe to channels, get real-time WebSocket updates |
@@ -280,11 +280,50 @@ WebSocket at `ws://localhost:8100/ws` for real-time channel subscriptions.
 | `HIVEMIND_LLM_PROVIDER` | `anthropic` | LLM provider (openai/anthropic/ollama/codegate/URL) |
 | `HIVEMIND_LLM_API_KEY` | - | LLM API key |
 | `HIVEMIND_LLM_MODEL` | `claude-sonnet-4-20250514` | LLM model |
-| `HIVEMIND_EMBEDDING_MODEL` | `openai:text-embedding-3-small` | Embedding model |
-| `HIVEMIND_EMBEDDING_API_KEY` | - | Embedding API key |
+| `HIVEMIND_EMBEDDING_MODEL` | `local:all-MiniLM-L6-v2` | Embedding model (see below) |
+| `HIVEMIND_EMBEDDING_API_KEY` | - | Embedding API key (not needed for local) |
 | `HIVEMIND_DATA_DIR` | `./data` | Snapshot directory |
 | `HIVEMIND_SNAPSHOT_INTERVAL` | `60` | Snapshot interval (seconds) |
 | `HIVEMIND_ENABLE_REPLICATION` | `false` | Enable Raft replication |
+
+## Embeddings
+
+HiveMindDB includes **built-in local embeddings** powered by [fastembed](https://github.com/Anush008/fastembed-rs) (ONNX Runtime, CPU-only). No external API key or service needed — embeddings just work out of the box.
+
+**Default model:** `all-MiniLM-L6-v2` (22M params, 384 dimensions, ~22MB download on first run)
+
+### Embedding Providers
+
+| Provider | Format | Example |
+|----------|--------|---------|
+| **Local (default)** | `local:<model>` | `local:all-MiniLM-L6-v2` |
+| OpenAI | `openai:<model>` | `openai:text-embedding-3-small` |
+| Ollama | `ollama:<model>` | `ollama:nomic-embed-text` |
+| CodeGate | `codegate:<model>` | `codegate:text-embedding-3-small` |
+| Custom URL | `http://host:port/v1` | Any OpenAI-compatible endpoint |
+
+### Available Local Models
+
+| Model | Params | Dims | Best For |
+|-------|--------|------|----------|
+| `all-MiniLM-L6-v2` | 22M | 384 | General purpose (default, fastest) |
+| `bge-small-en-v1.5` | 33M | 384 | English, high quality |
+| `snowflake-arctic-embed-xs` | ~22M | 384 | Lightweight, fast |
+| `nomic-embed-text-v1.5` | 137M | 768 | Multilingual, highest quality |
+| `jina-embeddings-v2-base-code` | 137M | 768 | Code-aware |
+| `embedding-gemma-300m` | 300M | - | Google, multilingual |
+
+See `embeddings.rs` for the full list of 20+ supported models.
+
+### Disabling Local Embeddings
+
+To build without the local embedding engine (smaller binary, API-only):
+
+```bash
+cargo build --no-default-features
+```
+
+Then set `HIVEMIND_EMBEDDING_MODEL=openai:text-embedding-3-small` and provide an API key.
 
 ## Building from Source
 
