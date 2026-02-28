@@ -1,7 +1,12 @@
-# HiveMindDB — Standalone 3-node cluster for development
+# HiveMindDB — 3-node Raft-replicated cluster for development
+#
+# Requires RaftimeDB cloned as a sibling directory:
+#   parent/
+#     HiveMindDB/    (this repo)
+#     RaftimeDB/     (https://github.com/NodeNestor/RaftimeDB)
 #
 # Usage:
-#   docker compose up -d
+#   docker compose up -d --build
 #   curl http://localhost:8100/api/v1/status
 #
 # Ports:
@@ -33,7 +38,10 @@ services:
 
   # === RaftTimeDB Consensus Layer ===
   rtdb-1:
-    image: ghcr.io/nodenestor/rafttimedb:latest
+    build:
+      context: ../../../../RaftimeDB
+      dockerfile: deploy/docker/Dockerfile
+    image: rafttimedb:local
     environment:
       RTDB_NODE_ID: "1"
       RTDB_RAFT_ADDR: "0.0.0.0:4001"
@@ -49,7 +57,10 @@ services:
       - rtdb1-data:/data
 
   rtdb-2:
-    image: ghcr.io/nodenestor/rafttimedb:latest
+    build:
+      context: ../../../../RaftimeDB
+      dockerfile: deploy/docker/Dockerfile
+    image: rafttimedb:local
     environment:
       RTDB_NODE_ID: "2"
       RTDB_RAFT_ADDR: "0.0.0.0:4001"
@@ -65,7 +76,10 @@ services:
       - rtdb2-data:/data
 
   rtdb-3:
-    image: ghcr.io/nodenestor/rafttimedb:latest
+    build:
+      context: ../../../../RaftimeDB
+      dockerfile: deploy/docker/Dockerfile
+    image: rafttimedb:local
     environment:
       RTDB_NODE_ID: "3"
       RTDB_RAFT_ADDR: "0.0.0.0:4001"

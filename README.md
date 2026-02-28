@@ -29,63 +29,80 @@ Agent 3 knows it instantly ◄── real-time push ◄── identical
 
 ## Quick Start
 
-### Option 1: Docker Compose (easiest)
+### Option 1: Docker Compose (standalone, no Raft)
 
-Spins up the full stack locally — SpacetimeDB + RaftTimeDB + HiveMindDB sidecars.
+Run just HiveMindDB as a single container — in-memory storage with local snapshots. No Raft replication, no SpacetimeDB. Good for local dev and single-agent setups.
 
 ```bash
 git clone https://github.com/NodeNestor/HiveMindDB.git
-cd HiveMindDB/deploy/docker
-docker compose up -d
+cd HiveMindDB
+docker build -f deploy/docker/Dockerfile -t hiveminddb .
+docker run -d --name hiveminddb -p 8100:8100 -v hivemind-data:/data hiveminddb
 ```
 
 Connect your agent to `http://localhost:8100`.
 
-### Option 2: Pre-built Binary
+### Option 2: Full Stack (Raft-replicated, 3-node)
 
-Download from [Releases](https://github.com/NodeNestor/HiveMindDB/releases) for your platform:
-
-| Platform | Binary |
-|----------|--------|
-| Linux x86_64 | `hiveminddb-x86_64-unknown-linux-gnu` |
-| Windows x86_64 | `hiveminddb-x86_64-pc-windows-msvc.exe` |
-| macOS ARM | `hiveminddb-aarch64-apple-darwin` |
+For fault-tolerant multi-node deployment with Raft consensus. Requires all NodeNestor repos:
 
 ```bash
-hiveminddb --listen-addr 0.0.0.0:8100
+# Clone all repos into the same parent directory
+git clone https://github.com/NodeNestor/HiveMindDB.git
+git clone https://github.com/NodeNestor/RaftimeDB.git
+git clone https://github.com/NodeNestor/CodeGate.git
+git clone https://github.com/NodeNestor/AgentCore.git
+
+# Use the integration docker-compose (builds everything from source)
+# Get it from: https://github.com/NodeNestor/AgentCore/blob/main/examples/docker-compose.swarm.yml
+docker compose up -d --build
 ```
 
 ### Option 3: Build from Source
 
 ```bash
-cargo install --path crates/core    # hiveminddb server
-cargo install --path crates/cli     # hmdb CLI
+git clone https://github.com/NodeNestor/HiveMindDB.git
+cd HiveMindDB
+cargo build --release -p hiveminddb   # server binary
+cargo build --release -p hmdb         # CLI tool
+
+# Install MCP server dependencies
+cd crates/mcp-server && npm install
+
+# Run
+./target/release/hiveminddb --listen-addr 0.0.0.0:8100
 ```
 
 ### With Claude Code (standalone)
 
 ```bash
-# Start HiveMindDB locally
-hiveminddb --listen-addr 0.0.0.0:8100
+# 1. Start HiveMindDB (build from source or Docker — see above)
+docker run -d --name hiveminddb -p 8100:8100 -v hivemind-data:/data hiveminddb
 
-# Add MCP server to Claude Code
-claude mcp add hivemind -- npx hiveminddb-mcp --url http://localhost:8100
+# 2. Clone the repo (needed for the MCP server)
+git clone https://github.com/NodeNestor/HiveMindDB.git
+cd HiveMindDB/crates/mcp-server && npm install
+
+# 3. Register MCP server with Claude Code
+claude mcp add-json hiveminddb '{"command":"node","args":["<path-to>/HiveMindDB/crates/mcp-server/src/index.js","--url","http://localhost:8100"]}'
 
 # Done. Claude Code now has 20 memory tools: remember, recall, search, extract, etc.
 ```
+
+> **Note:** Replace `<path-to>` with the actual path where you cloned HiveMindDB.
 
 ### With Claude Code (auto-memory hooks)
 
 For fully automatic memory — no manual `remember` calls needed:
 
 ```bash
-# 1. Add MCP server
-claude mcp add hivemind -- npx hiveminddb-mcp --url http://localhost:8100
+# 1. Start HiveMindDB + register MCP server (see "With Claude Code" above)
 
-# 2. Install hooks (copy from AgentCore or create manually)
+# 2. Install hooks (from AgentCore repo)
+git clone https://github.com/NodeNestor/AgentCore.git  # if not already cloned
 mkdir -p ~/.claude/hooks/hivemind
-# Download hook scripts from:
-#   https://github.com/NodeNestor/AgentCore/tree/main/hooks/hivemind
+cp AgentCore/hooks/hivemind/* ~/.claude/hooks/hivemind/
+chmod +x ~/.claude/hooks/hivemind/*.sh
 
 # 3. Add to ~/.claude/settings.json:
 ```
