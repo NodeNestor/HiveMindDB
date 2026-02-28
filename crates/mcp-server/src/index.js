@@ -336,6 +336,133 @@ const TOOLS = [
     description: "Get HiveMindDB cluster status — memory counts, embedding stats, extraction availability.",
     inputSchema: { type: "object", properties: {} },
   },
+
+  // --- Task management tools ---
+  {
+    name: "task_create",
+    description:
+      "Create a new task. The task will be assigned to an agent based on required capabilities.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Task title" },
+        description: { type: "string", description: "Task description" },
+        priority: {
+          type: "number",
+          description: "Priority level (default: 0, higher = more urgent)",
+        },
+        required_capabilities: {
+          type: "array",
+          items: { type: "string" },
+          description: "Capabilities required to perform this task",
+        },
+        dependencies: {
+          type: "array",
+          items: { type: "string" },
+          description: "IDs of tasks that must complete before this one",
+        },
+        deadline: {
+          type: "string",
+          description: "Deadline for the task (ISO 8601 string)",
+        },
+        metadata: {
+          type: "object",
+          description: "Additional metadata for the task",
+        },
+      },
+      required: ["title", "description"],
+    },
+  },
+  {
+    name: "task_list",
+    description:
+      "List tasks with optional filters by status and/or agent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: {
+          type: "string",
+          description:
+            'Filter by task status (e.g., "pending", "claimed", "in_progress", "completed", "failed")',
+        },
+        agent_id: {
+          type: "string",
+          description: "Filter by assigned agent ID",
+        },
+      },
+    },
+  },
+  {
+    name: "task_get",
+    description:
+      "Get detailed information about a specific task, including its events.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "ID of the task to retrieve" },
+      },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "task_claim",
+    description:
+      "Claim a pending task for this agent. The task must be in pending status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "ID of the task to claim" },
+      },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "task_start",
+    description:
+      "Start working on a claimed task. The task must be claimed by this agent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "ID of the task to start" },
+      },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "task_complete",
+    description:
+      "Mark a task as completed with the result of the work.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: {
+          type: "string",
+          description: "ID of the task to complete",
+        },
+        result: {
+          type: "string",
+          description: "The result or output of the completed task",
+        },
+      },
+      required: ["task_id", "result"],
+    },
+  },
+  {
+    name: "task_fail",
+    description:
+      "Mark a task as failed with the reason for failure.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "ID of the failed task" },
+        reason: {
+          type: "string",
+          description: "Reason why the task failed",
+        },
+      },
+      required: ["task_id", "reason"],
+    },
+  },
 ];
 
 // ============================================================================
@@ -613,6 +740,110 @@ async function handleTool(name, args) {
         `Extraction available: ${status.extraction_available}`,
         `Replication enabled: ${status.replication_enabled}`,
       ].join("\n");
+    }
+
+    // --- Task management tools ---
+    case "task_create": {
+      const agentId = process.env.AGENT_ID || "default";
+      const result = await apiCall("POST", "/api/v1/tasks", {
+        title: args.title,
+        description: args.description,
+        priority: args.priority || 0,
+        required_capabilities: args.required_capabilities || [],
+        created_by: agentId,
+        dependencies: args.dependencies || [],
+        deadline: args.deadline,
+        metadata: args.metadata || {},
+      });
+      return (
+        `Task created: #${result.id}\n` +
+        `  Title: ${result.title}\n` +
+        `  Status: ${result.status}\n` +
+        `  Priority: ${result.priority}\n` +
+        `  Created by: ${result.created_by}`
+      );
+    }
+
+    case "task_list": {
+      const params = new URLSearchParams();
+      if (args.status) params.set("status", args.status);
+      if (args.agent_id) params.set("agent_id", args.agent_id);
+      const query = params.toString();
+      const path = `/api/v1/tasks${query ? `?${query}` : ""}`;
+      const tasks = await apiCall("GET", path);
+      if (tasks.length === 0) return "No tasks found.";
+      return tasks
+        .map(
+          (t) =>
+            `#${t.id} [${t.status}] ${t.title} (priority: ${t.priority})` +
+            (t.assigned_to ? ` — assigned: ${t.assigned_to}` : "")
+        )
+        .join("\n");
+    }
+
+    case "task_get": {
+      const task = await apiCall("GET", `/api/v1/tasks/${args.task_id}`);
+      const lines = [
+        `Task #${task.id}`,
+        `  Title: ${task.title}`,
+        `  Description: ${task.description}`,
+        `  Status: ${task.status}`,
+        `  Priority: ${task.priority}`,
+        `  Created by: ${task.created_by}`,
+      ];
+      if (task.assigned_to) lines.push(`  Assigned to: ${task.assigned_to}`);
+      if (task.deadline) lines.push(`  Deadline: ${task.deadline}`);
+      if (task.required_capabilities && task.required_capabilities.length > 0) {
+        lines.push(`  Required capabilities: ${task.required_capabilities.join(", ")}`);
+      }
+      if (task.dependencies && task.dependencies.length > 0) {
+        lines.push(`  Dependencies: ${task.dependencies.join(", ")}`);
+      }
+      if (task.result) lines.push(`  Result: ${task.result}`);
+      if (task.metadata && Object.keys(task.metadata).length > 0) {
+        lines.push(`  Metadata: ${JSON.stringify(task.metadata)}`);
+      }
+      if (task.events && task.events.length > 0) {
+        lines.push(`  Events:`);
+        for (const event of task.events) {
+          lines.push(`    [${event.timestamp}] ${event.event_type} — ${event.agent_id || "system"}`);
+        }
+      }
+      return lines.join("\n");
+    }
+
+    case "task_claim": {
+      const agentId = process.env.AGENT_ID || "default";
+      await apiCall("POST", `/api/v1/tasks/${args.task_id}/claim`, {
+        agent_id: agentId,
+      });
+      return `Task #${args.task_id} claimed by agent "${agentId}"`;
+    }
+
+    case "task_start": {
+      const agentId = process.env.AGENT_ID || "default";
+      await apiCall("POST", `/api/v1/tasks/${args.task_id}/start`, {
+        agent_id: agentId,
+      });
+      return `Task #${args.task_id} started by agent "${agentId}"`;
+    }
+
+    case "task_complete": {
+      const agentId = process.env.AGENT_ID || "default";
+      await apiCall("POST", `/api/v1/tasks/${args.task_id}/complete`, {
+        agent_id: agentId,
+        result: args.result,
+      });
+      return `Task #${args.task_id} completed by agent "${agentId}"`;
+    }
+
+    case "task_fail": {
+      const agentId = process.env.AGENT_ID || "default";
+      await apiCall("POST", `/api/v1/tasks/${args.task_id}/fail`, {
+        agent_id: agentId,
+        reason: args.reason,
+      });
+      return `Task #${args.task_id} marked as failed by agent "${agentId}": ${args.reason}`;
     }
 
     default:

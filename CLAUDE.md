@@ -48,7 +48,7 @@ deploy/
 
 ```bash
 cargo build                    # Build core + CLI
-cargo test                     # Run all 44 tests
+cargo test                     # Run all tests
 cd crates/mcp-server && npm install  # Install MCP server deps
 ```
 
@@ -114,6 +114,14 @@ cd crates/mcp-server && npm install  # Install MCP server deps
 | `/api/v1/agents/register` | POST | Register agent |
 | `/api/v1/agents` | GET | List agents |
 | `/api/v1/agents/:id/heartbeat` | POST | Agent heartbeat |
-| `/ws` | GET (upgrade) | WebSocket real-time subscriptions |
-| `/api/v1/status` | GET | Cluster stats |
+| `/api/v1/tasks` | POST | Create task |
+| `/api/v1/tasks` | GET | List tasks (filters: status, agent_id) |
+| `/api/v1/tasks/:id` | GET | Get task + events |
+| `/api/v1/tasks/:id/claim` | POST | Claim pending task |
+| `/api/v1/tasks/:id/start` | POST | Start claimed task |
+| `/api/v1/tasks/:id/complete` | POST | Complete task with result |
+| `/api/v1/tasks/:id/fail` | POST | Fail task with reason |
+| `/api/v1/tasks/:id/events` | GET | Task event log |
+| `/ws` | GET (upgrade) | WebSocket real-time subscriptions (+ SubscribeTasks) |
+| `/api/v1/status` | GET | Cluster stats (includes task counts) |
 | `/health` | GET | Health check |

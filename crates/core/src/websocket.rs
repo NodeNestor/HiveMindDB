@@ -120,6 +120,34 @@ async fn handle_client_message(
             let _ = tx.send(serde_json::to_string(&resp).unwrap());
         }
 
+        WsClientMessage::SubscribeTasks {
+            capabilities: _capabilities,
+            agent_id,
+        } => {
+            // Auto-subscribe to the "tasks" channel for real-time task events
+            let channel_name = "tasks";
+            if channels.get_channel_by_name(channel_name).is_none() {
+                channels.create_channel(CreateChannelRequest {
+                    name: channel_name.to_string(),
+                    description: Some("Task event broadcast channel".into()),
+                    channel_type: ChannelType::Public,
+                    created_by: agent_id.clone(),
+                });
+            }
+
+            if let Some(rx) = channels.subscribe_by_name(channel_name, &agent_id) {
+                let tx_clone = tx.clone();
+                let handle = tokio::spawn(forward_channel_messages(rx, tx_clone));
+                active_receivers.lock().await.push(handle);
+            }
+
+            let resp = WsServerMessage::Subscribed {
+                channels: vec![channel_name.to_string()],
+            };
+            let _ = tx.send(serde_json::to_string(&resp).unwrap());
+            info!(agent_id = %agent_id, "Agent subscribed to tasks");
+        }
+
         WsClientMessage::Unsubscribe { channels: _ } => {
             // Unsubscribe is handled by dropping receivers on disconnect.
             // Per-channel unsubscribe would need receiver tracking by channel name.

@@ -26,11 +26,16 @@ pub struct MemoryEngine {
     episodes: DashMap<u64, Episode>,
     agents: DashMap<String, Agent>,
     history: DashMap<u64, Vec<MemoryHistory>>,
+    // Task stores
+    tasks: DashMap<u64, Task>,
+    task_events: DashMap<u64, Vec<TaskEvent>>,
     next_memory_id: AtomicU64,
     next_entity_id: AtomicU64,
     next_relationship_id: AtomicU64,
     next_episode_id: AtomicU64,
     next_history_id: AtomicU64,
+    next_task_id: AtomicU64,
+    next_task_event_id: AtomicU64,
     // Extraction pipeline (LLM-powered)
     extraction: ExtractionPipeline,
     // Embedding engine (vector search)
@@ -53,11 +58,15 @@ impl MemoryEngine {
             episodes: DashMap::new(),
             agents: DashMap::new(),
             history: DashMap::new(),
+            tasks: DashMap::new(),
+            task_events: DashMap::new(),
             next_memory_id: AtomicU64::new(1),
             next_entity_id: AtomicU64::new(1),
             next_relationship_id: AtomicU64::new(1),
             next_episode_id: AtomicU64::new(1),
             next_history_id: AtomicU64::new(1),
+            next_task_id: AtomicU64::new(1),
+            next_task_event_id: AtomicU64::new(1),
             extraction,
             embeddings,
             replication_tx: None,
@@ -84,6 +93,8 @@ impl MemoryEngine {
         let mut max_rel_id = 0u64;
         let mut max_episode_id = 0u64;
         let mut max_history_id = 0u64;
+        let mut max_task_id = 0u64;
+        let mut max_task_event_id = 0u64;
 
         for memory in snapshot.memories {
             max_memory_id = max_memory_id.max(memory.id);
@@ -110,6 +121,16 @@ impl MemoryEngine {
             }
             self.history.insert(memory_id, hist_entries);
         }
+        for task in snapshot.tasks {
+            max_task_id = max_task_id.max(task.id);
+            self.tasks.insert(task.id, task);
+        }
+        for (task_id, events) in snapshot.task_events {
+            for e in &events {
+                max_task_event_id = max_task_event_id.max(e.id);
+            }
+            self.task_events.insert(task_id, events);
+        }
 
         // Set counters past the max existing IDs
         self.next_memory_id.store(max_memory_id + 1, Ordering::Relaxed);
@@ -117,12 +138,15 @@ impl MemoryEngine {
         self.next_relationship_id.store(max_rel_id + 1, Ordering::Relaxed);
         self.next_episode_id.store(max_episode_id + 1, Ordering::Relaxed);
         self.next_history_id.store(max_history_id + 1, Ordering::Relaxed);
+        self.next_task_id.store(max_task_id + 1, Ordering::Relaxed);
+        self.next_task_event_id.store(max_task_event_id + 1, Ordering::Relaxed);
 
         info!(
             memories = self.memories.len(),
             entities = self.entities.len(),
             relationships = self.relationships.len(),
             agents = self.agents.len(),
+            tasks = self.tasks.len(),
             "State restored from snapshot"
         );
     }
@@ -139,6 +163,8 @@ impl MemoryEngine {
             agents: self.agents.iter().map(|a| a.value().clone()).collect(),
             history: self.history.iter().map(|h| (*h.key(), h.value().clone())).collect(),
             channels: vec![], // Channels are managed by ChannelHub
+            tasks: self.tasks.iter().map(|t| t.value().clone()).collect(),
+            task_events: self.task_events.iter().map(|e| (*e.key(), e.value().clone())).collect(),
         }
     }
 
@@ -796,6 +822,223 @@ impl MemoryEngine {
     // Stats
     // ========================================================================
 
+    // ========================================================================
+    // Task CRUD
+    // ========================================================================
+
+    pub fn create_task(&self, req: CreateTaskRequest) -> Task {
+        let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        let now = Utc::now();
+
+        let task = Task {
+            id,
+            title: req.title,
+            description: req.description,
+            status: TaskStatus::Pending,
+            priority: req.priority,
+            required_capabilities: req.required_capabilities,
+            assigned_agent: None,
+            created_by: req.created_by.clone(),
+            dependencies: req.dependencies,
+            result: None,
+            created_at: now,
+            updated_at: now,
+            deadline: req.deadline,
+            metadata: req.metadata,
+        };
+
+        self.tasks.insert(id, task.clone());
+
+        // Record event
+        let event_id = self.next_task_event_id.fetch_add(1, Ordering::Relaxed);
+        let event = TaskEvent {
+            id: event_id,
+            task_id: id,
+            event_type: TaskEventType::Created,
+            agent_id: Some(req.created_by),
+            details: None,
+            timestamp: now,
+        };
+        self.task_events.entry(id).or_default().push(event);
+
+        self.emit_replication(ReplicationEvent::TaskCreated { task: task.clone() });
+        info!(task_id = id, "Task created");
+        task
+    }
+
+    pub fn claim_task(&self, task_id: u64, agent_id: &str) -> Result<Task, String> {
+        let mut entry = self.tasks.get_mut(&task_id)
+            .ok_or_else(|| format!("Task {} not found", task_id))?;
+
+        let task = entry.value_mut();
+        if task.status != TaskStatus::Pending {
+            return Err(format!("Task {} is not pending (status: {:?})", task_id, task.status));
+        }
+
+        task.status = TaskStatus::Claimed;
+        task.assigned_agent = Some(agent_id.to_string());
+        task.updated_at = Utc::now();
+
+        let task_clone = task.clone();
+        drop(entry);
+
+        let event_id = self.next_task_event_id.fetch_add(1, Ordering::Relaxed);
+        let event = TaskEvent {
+            id: event_id,
+            task_id,
+            event_type: TaskEventType::Claimed,
+            agent_id: Some(agent_id.to_string()),
+            details: None,
+            timestamp: Utc::now(),
+        };
+        self.task_events.entry(task_id).or_default().push(event);
+
+        self.emit_replication(ReplicationEvent::TaskClaimed { task: task_clone.clone() });
+        info!(task_id, agent_id, "Task claimed");
+        Ok(task_clone)
+    }
+
+    pub fn start_task(&self, task_id: u64, agent_id: &str) -> Result<Task, String> {
+        let mut entry = self.tasks.get_mut(&task_id)
+            .ok_or_else(|| format!("Task {} not found", task_id))?;
+
+        let task = entry.value_mut();
+        if task.status != TaskStatus::Claimed {
+            return Err(format!("Task {} is not claimed (status: {:?})", task_id, task.status));
+        }
+        if task.assigned_agent.as_deref() != Some(agent_id) {
+            return Err(format!("Task {} is assigned to {:?}, not {}", task_id, task.assigned_agent, agent_id));
+        }
+
+        task.status = TaskStatus::InProgress;
+        task.updated_at = Utc::now();
+
+        let task_clone = task.clone();
+        drop(entry);
+
+        let event_id = self.next_task_event_id.fetch_add(1, Ordering::Relaxed);
+        let event = TaskEvent {
+            id: event_id,
+            task_id,
+            event_type: TaskEventType::Started,
+            agent_id: Some(agent_id.to_string()),
+            details: None,
+            timestamp: Utc::now(),
+        };
+        self.task_events.entry(task_id).or_default().push(event);
+
+        info!(task_id, agent_id, "Task started");
+        Ok(task_clone)
+    }
+
+    pub fn complete_task(&self, task_id: u64, agent_id: &str, result: String) -> Result<Task, String> {
+        let mut entry = self.tasks.get_mut(&task_id)
+            .ok_or_else(|| format!("Task {} not found", task_id))?;
+
+        let task = entry.value_mut();
+        if task.assigned_agent.as_deref() != Some(agent_id) {
+            return Err(format!("Task {} is assigned to {:?}, not {}", task_id, task.assigned_agent, agent_id));
+        }
+
+        task.status = TaskStatus::Completed;
+        task.result = Some(result.clone());
+        task.updated_at = Utc::now();
+
+        let task_clone = task.clone();
+        drop(entry);
+
+        let event_id = self.next_task_event_id.fetch_add(1, Ordering::Relaxed);
+        let event = TaskEvent {
+            id: event_id,
+            task_id,
+            event_type: TaskEventType::Completed,
+            agent_id: Some(agent_id.to_string()),
+            details: Some(result),
+            timestamp: Utc::now(),
+        };
+        self.task_events.entry(task_id).or_default().push(event);
+
+        self.emit_replication(ReplicationEvent::TaskCompleted { task: task_clone.clone() });
+        info!(task_id, agent_id, "Task completed");
+        Ok(task_clone)
+    }
+
+    pub fn fail_task(&self, task_id: u64, agent_id: &str, reason: String) -> Result<Task, String> {
+        let mut entry = self.tasks.get_mut(&task_id)
+            .ok_or_else(|| format!("Task {} not found", task_id))?;
+
+        let task = entry.value_mut();
+        task.status = TaskStatus::Failed;
+        task.result = Some(reason.clone());
+        task.updated_at = Utc::now();
+
+        let task_clone = task.clone();
+        drop(entry);
+
+        let event_id = self.next_task_event_id.fetch_add(1, Ordering::Relaxed);
+        let event = TaskEvent {
+            id: event_id,
+            task_id,
+            event_type: TaskEventType::Failed,
+            agent_id: Some(agent_id.to_string()),
+            details: Some(reason),
+            timestamp: Utc::now(),
+        };
+        self.task_events.entry(task_id).or_default().push(event);
+
+        self.emit_replication(ReplicationEvent::TaskFailed { task: task_clone.clone() });
+        info!(task_id, agent_id, "Task failed");
+        Ok(task_clone)
+    }
+
+    pub fn get_task(&self, task_id: u64) -> Option<Task> {
+        self.tasks.get(&task_id).map(|t| t.value().clone())
+    }
+
+    pub fn list_tasks(
+        &self,
+        status: Option<&TaskStatus>,
+        agent_id: Option<&str>,
+        capabilities: Option<&[String]>,
+    ) -> Vec<Task> {
+        self.tasks
+            .iter()
+            .filter(|entry| {
+                let task = entry.value();
+                if let Some(s) = status {
+                    if &task.status != s {
+                        return false;
+                    }
+                }
+                if let Some(aid) = agent_id {
+                    if task.assigned_agent.as_deref() != Some(aid) {
+                        return false;
+                    }
+                }
+                if let Some(caps) = capabilities {
+                    if !task.required_capabilities.is_empty()
+                        && !task.required_capabilities.iter().any(|c| caps.contains(c))
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    pub fn get_task_events(&self, task_id: u64) -> Vec<TaskEvent> {
+        self.task_events
+            .get(&task_id)
+            .map(|events| events.value().clone())
+            .unwrap_or_default()
+    }
+
+    // ========================================================================
+    // Stats
+    // ========================================================================
+
     pub fn stats(&self) -> serde_json::Value {
         serde_json::json!({
             "memories": self.memories.len(),
@@ -808,6 +1051,10 @@ impl MemoryEngine {
             "embedding_dimensions": self.embeddings.dimensions(),
             "extraction_available": self.extraction.is_available(),
             "replication_enabled": self.replication_tx.is_some(),
+            "tasks_total": self.tasks.len(),
+            "tasks_pending": self.tasks.iter().filter(|t| t.value().status == TaskStatus::Pending).count(),
+            "tasks_in_progress": self.tasks.iter().filter(|t| t.value().status == TaskStatus::InProgress).count(),
+            "tasks_completed": self.tasks.iter().filter(|t| t.value().status == TaskStatus::Completed).count(),
         })
     }
 }
@@ -1244,5 +1491,165 @@ mod tests {
             metadata: serde_json::Value::Null,
         });
         assert!(new_mem.id > 1);
+    }
+
+    // ====================================================================
+    // Task Tests
+    // ====================================================================
+
+    fn make_task_request(title: &str) -> CreateTaskRequest {
+        CreateTaskRequest {
+            title: title.into(),
+            description: format!("Description for {}", title),
+            priority: 1,
+            required_capabilities: vec!["code".into()],
+            created_by: "user-1".into(),
+            dependencies: vec![],
+            deadline: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn test_create_task() {
+        let engine = MemoryEngine::new(test_config());
+        let task = engine.create_task(make_task_request("Fix bug"));
+
+        assert_eq!(task.title, "Fix bug");
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert!(task.assigned_agent.is_none());
+        assert_eq!(task.priority, 1);
+
+        // Verify event was created
+        let events = engine.get_task_events(task.id);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, TaskEventType::Created);
+    }
+
+    #[test]
+    fn test_claim_task() {
+        let engine = MemoryEngine::new(test_config());
+        let task = engine.create_task(make_task_request("Fix bug"));
+
+        let claimed = engine.claim_task(task.id, "agent-1").unwrap();
+        assert_eq!(claimed.status, TaskStatus::Claimed);
+        assert_eq!(claimed.assigned_agent.as_deref(), Some("agent-1"));
+
+        let events = engine.get_task_events(task.id);
+        assert_eq!(events.len(), 2); // created + claimed
+    }
+
+    #[test]
+    fn test_double_claim_rejected() {
+        let engine = MemoryEngine::new(test_config());
+        let task = engine.create_task(make_task_request("Fix bug"));
+
+        engine.claim_task(task.id, "agent-1").unwrap();
+        let result = engine.claim_task(task.id, "agent-2");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not pending"));
+    }
+
+    #[test]
+    fn test_start_task() {
+        let engine = MemoryEngine::new(test_config());
+        let task = engine.create_task(make_task_request("Fix bug"));
+        engine.claim_task(task.id, "agent-1").unwrap();
+
+        let started = engine.start_task(task.id, "agent-1").unwrap();
+        assert_eq!(started.status, TaskStatus::InProgress);
+    }
+
+    #[test]
+    fn test_start_task_wrong_agent() {
+        let engine = MemoryEngine::new(test_config());
+        let task = engine.create_task(make_task_request("Fix bug"));
+        engine.claim_task(task.id, "agent-1").unwrap();
+
+        let result = engine.start_task(task.id, "agent-2");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_complete_task() {
+        let engine = MemoryEngine::new(test_config());
+        let task = engine.create_task(make_task_request("Fix bug"));
+        engine.claim_task(task.id, "agent-1").unwrap();
+        engine.start_task(task.id, "agent-1").unwrap();
+
+        let completed = engine.complete_task(task.id, "agent-1", "Bug fixed".into()).unwrap();
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.result.as_deref(), Some("Bug fixed"));
+
+        let events = engine.get_task_events(task.id);
+        assert_eq!(events.len(), 4); // created + claimed + started + completed
+    }
+
+    #[test]
+    fn test_fail_task() {
+        let engine = MemoryEngine::new(test_config());
+        let task = engine.create_task(make_task_request("Fix bug"));
+        engine.claim_task(task.id, "agent-1").unwrap();
+
+        let failed = engine.fail_task(task.id, "agent-1", "Could not reproduce".into()).unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.result.as_deref(), Some("Could not reproduce"));
+    }
+
+    #[test]
+    fn test_list_tasks_with_filters() {
+        let engine = MemoryEngine::new(test_config());
+        engine.create_task(make_task_request("Task 1"));
+        let task2 = engine.create_task(make_task_request("Task 2"));
+        engine.create_task(make_task_request("Task 3"));
+        engine.claim_task(task2.id, "agent-1").unwrap();
+
+        // All tasks
+        assert_eq!(engine.list_tasks(None, None, None).len(), 3);
+
+        // Only pending
+        let pending = engine.list_tasks(Some(&TaskStatus::Pending), None, None);
+        assert_eq!(pending.len(), 2);
+
+        // Only agent-1's tasks
+        let agent_tasks = engine.list_tasks(None, Some("agent-1"), None);
+        assert_eq!(agent_tasks.len(), 1);
+        assert_eq!(agent_tasks[0].title, "Task 2");
+    }
+
+    #[test]
+    fn test_task_stats() {
+        let engine = MemoryEngine::new(test_config());
+        engine.create_task(make_task_request("Task 1"));
+        let task2 = engine.create_task(make_task_request("Task 2"));
+        engine.claim_task(task2.id, "agent-1").unwrap();
+        engine.start_task(task2.id, "agent-1").unwrap();
+
+        let stats = engine.stats();
+        assert_eq!(stats["tasks_total"], 2);
+        assert_eq!(stats["tasks_pending"], 1);
+        assert_eq!(stats["tasks_in_progress"], 1);
+    }
+
+    #[test]
+    fn test_task_snapshot_roundtrip() {
+        let engine = MemoryEngine::new(test_config());
+        let task = engine.create_task(make_task_request("Snapshot task"));
+        engine.claim_task(task.id, "agent-1").unwrap();
+
+        let snapshot = engine.create_snapshot();
+        assert_eq!(snapshot.tasks.len(), 1);
+        assert!(!snapshot.task_events.is_empty());
+
+        let mut engine2 = MemoryEngine::new(test_config());
+        engine2.restore_from_snapshot(snapshot);
+
+        let restored = engine2.get_task(task.id).unwrap();
+        assert_eq!(restored.title, "Snapshot task");
+        assert_eq!(restored.status, TaskStatus::Claimed);
+
+        // IDs should continue past restored state
+        let new_task = engine2.create_task(make_task_request("New task"));
+        assert!(new_task.id > task.id);
     }
 }

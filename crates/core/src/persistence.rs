@@ -28,10 +28,14 @@ pub struct Snapshot {
     pub agents: Vec<Agent>,
     pub history: Vec<(u64, Vec<MemoryHistory>)>,
     pub channels: Vec<Channel>,
+    #[serde(default)]
+    pub tasks: Vec<Task>,
+    #[serde(default)]
+    pub task_events: Vec<(u64, Vec<TaskEvent>)>,
 }
 
 impl Snapshot {
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = 2;
 }
 
 /// Manages snapshot persistence to disk.
@@ -119,6 +123,10 @@ pub enum ReplicationEvent {
     RelationshipAdded { relationship: Relationship },
     AgentRegistered { agent: Agent },
     ChannelCreated { channel: Channel },
+    TaskCreated { task: Task },
+    TaskClaimed { task: Task },
+    TaskCompleted { task: Task },
+    TaskFailed { task: Task },
 }
 
 impl ReplicationClient {
@@ -281,6 +289,8 @@ mod tests {
             agents: vec![],
             history: vec![],
             channels: vec![],
+            tasks: vec![],
+            task_events: vec![],
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();
@@ -322,6 +332,8 @@ mod tests {
             agents: vec![],
             history: vec![],
             channels: vec![],
+            tasks: vec![],
+            task_events: vec![],
         };
 
         manager.save(&snapshot).await.unwrap();
