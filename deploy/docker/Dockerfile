@@ -15,7 +15,7 @@ RUN cargo build --release --bin hiveminddb --bin hmdb
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl \
+    ca-certificates curl libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/hiveminddb /usr/local/bin/

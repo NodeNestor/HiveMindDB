@@ -55,7 +55,7 @@ cd crates/mcp-server && npm install  # Install MCP server deps
 ## Key Design Decisions
 
 - **In-memory + snapshot**: Core engine uses DashMap for concurrent in-memory storage, with periodic JSON snapshots to disk for restart recovery.
-- **Hybrid search**: Combines keyword matching (always available) with vector similarity via external embedding APIs (OpenAI, Ollama, CodeGate). Falls back gracefully when embeddings are not configured.
+- **Hybrid search**: Combines keyword matching with vector similarity. Local embeddings enabled by default via `fastembed` (ONNX Runtime, CPU-only, 22M param model). Also supports external APIs (OpenAI, Ollama, CodeGate). Falls back to keyword-only when embeddings are disabled.
 - **LLM extraction**: Sends conversation text to an LLM (OpenAI/Anthropic/Ollama/CodeGate) to extract facts, entities, and relationships. Handles conflict resolution (ADD/UPDATE/NOOP).
 - **Provider-agnostic**: LLM and embedding calls work with any OpenAI-compatible API, including CodeGate proxy, Ollama local models, and custom URLs.
 - **MCP-first**: Primary interface is MCP tools (drop-in compatible with AgentCore's agent-memory).
@@ -85,7 +85,7 @@ cd crates/mcp-server && npm install  # Install MCP server deps
 | `--llm-provider` | `HIVEMIND_LLM_PROVIDER` | `anthropic` | LLM provider (openai/anthropic/ollama/codegate/URL) |
 | `--llm-api-key` | `HIVEMIND_LLM_API_KEY` | none | LLM API key |
 | `--llm-model` | `HIVEMIND_LLM_MODEL` | `claude-sonnet-4-20250514` | LLM model for extraction |
-| `--embedding-model` | `HIVEMIND_EMBEDDING_MODEL` | `openai:text-embedding-3-small` | Embedding model (provider:model) |
+| `--embedding-model` | `HIVEMIND_EMBEDDING_MODEL` | `local:all-MiniLM-L6-v2` | Embedding model (provider:model) |
 | `--embedding-api-key` | `HIVEMIND_EMBEDDING_API_KEY` | none | Embedding API key |
 | `--data-dir` | `HIVEMIND_DATA_DIR` | `./data` | Snapshot directory |
 | `--snapshot-interval` | `HIVEMIND_SNAPSHOT_INTERVAL` | `60` | Snapshot interval (seconds, 0=disable) |
