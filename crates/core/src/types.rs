@@ -291,6 +291,104 @@ pub struct RegisterAgentRequest {
 }
 
 // ============================================================================
+// Task Types
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    Claimed,
+    InProgress,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    pub id: u64,
+    pub title: String,
+    pub description: String,
+    pub status: TaskStatus,
+    pub priority: u32,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    pub assigned_agent: Option<String>,
+    pub created_by: String,
+    #[serde(default)]
+    pub dependencies: Vec<u64>,
+    pub result: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub deadline: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskEventType {
+    Created,
+    Claimed,
+    Started,
+    Progress,
+    Completed,
+    Failed,
+    Cancelled,
+    Reassigned,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskEvent {
+    pub id: u64,
+    pub task_id: u64,
+    pub event_type: TaskEventType,
+    pub agent_id: Option<String>,
+    pub details: Option<String>,
+    pub timestamp: DateTime<Utc>,
+}
+
+// ============================================================================
+// Task API Request Types
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTaskRequest {
+    pub title: String,
+    pub description: String,
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    pub created_by: String,
+    #[serde(default)]
+    pub dependencies: Vec<u64>,
+    #[serde(default)]
+    pub deadline: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClaimTaskRequest {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompleteTaskRequest {
+    pub agent_id: String,
+    pub result: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FailTaskRequest {
+    pub agent_id: String,
+    pub reason: String,
+}
+
+// ============================================================================
 // Extraction Response Types
 // ============================================================================
 
@@ -319,6 +417,11 @@ pub enum WsClientMessage {
     Unsubscribe {
         channels: Vec<String>,
     },
+    SubscribeTasks {
+        #[serde(default)]
+        capabilities: Vec<String>,
+        agent_id: String,
+    },
     Ping,
 }
 
@@ -330,6 +433,11 @@ pub enum WsServerMessage {
     MemoryInvalidated { channel: String, memory_id: u64, reason: String },
     EntityUpdated { channel: String, entity: Entity },
     Subscribed { channels: Vec<String> },
+    TaskCreated { task: Task },
+    TaskClaimed { task: Task },
+    TaskUpdated { task: Task },
+    TaskCompleted { task: Task },
+    TaskFailed { task: Task },
     Pong,
     Error { message: String },
 }

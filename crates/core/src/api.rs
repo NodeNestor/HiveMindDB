@@ -43,6 +43,15 @@ pub fn router(engine: Arc<MemoryEngine>, channels: Arc<ChannelHub>) -> Router {
         .route("/api/v1/channels", post(create_channel))
         .route("/api/v1/channels", get(list_channels))
         .route("/api/v1/channels/{id}/share", post(share_to_channel))
+        // Tasks
+        .route("/api/v1/tasks", post(create_task))
+        .route("/api/v1/tasks", get(list_tasks))
+        .route("/api/v1/tasks/{id}", get(get_task))
+        .route("/api/v1/tasks/{id}/claim", post(claim_task))
+        .route("/api/v1/tasks/{id}/start", post(start_task))
+        .route("/api/v1/tasks/{id}/complete", post(complete_task))
+        .route("/api/v1/tasks/{id}/fail", post(fail_task))
+        .route("/api/v1/tasks/{id}/events", get(task_events))
         // Agents
         .route("/api/v1/agents/register", post(register_agent))
         .route("/api/v1/agents", get(list_agents))
@@ -371,6 +380,134 @@ async fn agent_heartbeat(
 ) -> StatusCode {
     state.engine.heartbeat_agent(&agent_id);
     StatusCode::OK
+}
+
+// ============================================================================
+// Tasks
+// ============================================================================
+
+async fn create_task(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateTaskRequest>,
+) -> (StatusCode, Json<Task>) {
+    let task = state.engine.create_task(req);
+
+    // Broadcast to tasks channel
+    state.channels.broadcast_to_channel_by_name(
+        "tasks",
+        WsServerMessage::TaskCreated { task: task.clone() },
+    );
+
+    (StatusCode::CREATED, Json(task))
+}
+
+#[derive(serde::Deserialize)]
+struct ListTasksQuery {
+    status: Option<String>,
+    agent_id: Option<String>,
+}
+
+async fn list_tasks(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<ListTasksQuery>,
+) -> Json<Vec<Task>> {
+    let status = query.status.as_deref().and_then(|s| match s {
+        "pending" => Some(TaskStatus::Pending),
+        "claimed" => Some(TaskStatus::Claimed),
+        "in_progress" => Some(TaskStatus::InProgress),
+        "completed" => Some(TaskStatus::Completed),
+        "failed" => Some(TaskStatus::Failed),
+        "cancelled" => Some(TaskStatus::Cancelled),
+        _ => None,
+    });
+    Json(state.engine.list_tasks(status.as_ref(), query.agent_id.as_deref(), None))
+}
+
+async fn get_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let task = state.engine.get_task(id).ok_or(StatusCode::NOT_FOUND)?;
+    let events = state.engine.get_task_events(id);
+    Ok(Json(serde_json::json!({
+        "task": task,
+        "events": events,
+    })))
+}
+
+async fn claim_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+    Json(req): Json<ClaimTaskRequest>,
+) -> Result<Json<Task>, (StatusCode, String)> {
+    match state.engine.claim_task(id, &req.agent_id) {
+        Ok(task) => {
+            state.channels.broadcast_to_channel_by_name(
+                "tasks",
+                WsServerMessage::TaskClaimed { task: task.clone() },
+            );
+            Ok(Json(task))
+        }
+        Err(e) => Err((StatusCode::CONFLICT, e)),
+    }
+}
+
+async fn start_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+    Json(req): Json<ClaimTaskRequest>,
+) -> Result<Json<Task>, (StatusCode, String)> {
+    match state.engine.start_task(id, &req.agent_id) {
+        Ok(task) => {
+            state.channels.broadcast_to_channel_by_name(
+                "tasks",
+                WsServerMessage::TaskUpdated { task: task.clone() },
+            );
+            Ok(Json(task))
+        }
+        Err(e) => Err((StatusCode::CONFLICT, e)),
+    }
+}
+
+async fn complete_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+    Json(req): Json<CompleteTaskRequest>,
+) -> Result<Json<Task>, (StatusCode, String)> {
+    match state.engine.complete_task(id, &req.agent_id, req.result) {
+        Ok(task) => {
+            state.channels.broadcast_to_channel_by_name(
+                "tasks",
+                WsServerMessage::TaskCompleted { task: task.clone() },
+            );
+            Ok(Json(task))
+        }
+        Err(e) => Err((StatusCode::CONFLICT, e)),
+    }
+}
+
+async fn fail_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+    Json(req): Json<FailTaskRequest>,
+) -> Result<Json<Task>, (StatusCode, String)> {
+    match state.engine.fail_task(id, &req.agent_id, req.reason) {
+        Ok(task) => {
+            state.channels.broadcast_to_channel_by_name(
+                "tasks",
+                WsServerMessage::TaskFailed { task: task.clone() },
+            );
+            Ok(Json(task))
+        }
+        Err(e) => Err((StatusCode::CONFLICT, e)),
+    }
+}
+
+async fn task_events(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> Json<Vec<TaskEvent>> {
+    Json(state.engine.get_task_events(id))
 }
 
 // ============================================================================
