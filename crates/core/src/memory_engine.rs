@@ -94,6 +94,11 @@ impl MemoryEngine {
         self.replication_tx = Some(tx);
     }
 
+    /// Get a reference to the config.
+    pub fn config(&self) -> &HiveMindConfig {
+        &self.config
+    }
+
     /// Get a reference to the embedding engine (for async operations).
     pub fn embeddings(&self) -> &Arc<EmbeddingEngine> {
         &self.embeddings
@@ -1179,6 +1184,298 @@ impl MemoryEngine {
     // Stats
     // ========================================================================
 
+    /// Get detailed health info for all subsystems.
+    pub fn health_details(&self) -> (EmbeddingHealthInfo, InvertedIndexHealthInfo, MemoryStoreHealthInfo, KnowledgeGraphHealthInfo, TasksHealthInfo) {
+        let total_memories = self.memories.len();
+        let valid_memories = self.memories.iter().filter(|m| m.value().valid_until.is_none()).count();
+
+        let embedding = EmbeddingHealthInfo {
+            available: self.embeddings.is_available(),
+            provider: self.embeddings.provider().to_string(),
+            model: self.embeddings.model().to_string(),
+            indexed_count: self.embeddings.indexed_count(),
+            dimensions: self.embeddings.dimensions(),
+            pool_size: self.embeddings.pool_size(),
+        };
+
+        let inverted_index = InvertedIndexHealthInfo {
+            unique_words: self.inverted_index.len(),
+        };
+
+        let history_entries: usize = self.history.iter().map(|h| h.value().len()).sum();
+        let memory_store = MemoryStoreHealthInfo {
+            total_memories,
+            valid_memories,
+            invalidated_memories: total_memories - valid_memories,
+            history_entries,
+        };
+
+        let knowledge_graph = KnowledgeGraphHealthInfo {
+            entities: self.entities.len(),
+            relationships: self.relationships.len(),
+        };
+
+        let tasks = TasksHealthInfo {
+            total: self.tasks.len(),
+            pending: self.tasks.iter().filter(|t| t.value().status == TaskStatus::Pending).count(),
+            in_progress: self.tasks.iter().filter(|t| t.value().status == TaskStatus::InProgress).count(),
+            completed: self.tasks.iter().filter(|t| t.value().status == TaskStatus::Completed).count(),
+            failed: self.tasks.iter().filter(|t| t.value().status == TaskStatus::Failed).count(),
+        };
+
+        (embedding, inverted_index, memory_store, knowledge_graph, tasks)
+    }
+
+    /// Get embedding engine details.
+    pub fn embedding_info(&self) -> SystemEmbeddingResponse {
+        SystemEmbeddingResponse {
+            provider: self.embeddings.provider().to_string(),
+            model: self.embeddings.model().to_string(),
+            dimensions: self.embeddings.dimensions(),
+            indexed_count: self.embeddings.indexed_count(),
+            pool_size: self.embeddings.pool_size(),
+            available: self.embeddings.is_available(),
+        }
+    }
+
+    /// Run a benchmark suite and return structured results.
+    pub async fn run_benchmark(&self, req: &BenchmarkRequest) -> BenchmarkResponse {
+        let start = std::time::Instant::now();
+        let bench_id = uuid::Uuid::new_v4().to_string();
+        let agent_id = format!("benchmark-{}", bench_id);
+
+        let memories_before = self.memories.len();
+        let entities_before = self.entities.len();
+
+        let mut results = Vec::new();
+
+        for op in &req.operations {
+            let result = self.run_single_benchmark(op, req.iterations, &agent_id).await;
+            results.push(result);
+        }
+
+        let memories_after = self.memories.len();
+        let entities_after = self.entities.len();
+
+        if req.cleanup {
+            self.cleanup_benchmark_data(&agent_id);
+        }
+
+        BenchmarkResponse {
+            results,
+            system_info: BenchmarkSystemInfo {
+                memories_before,
+                memories_after: if req.cleanup { self.memories.len() } else { memories_after },
+                entities_before,
+                entities_after: if req.cleanup { self.entities.len() } else { entities_after },
+                embedding_provider: self.embeddings.provider().to_string(),
+                embedding_model: self.embeddings.model().to_string(),
+            },
+            total_elapsed_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+
+    async fn run_single_benchmark(&self, operation: &str, iterations: usize, agent_id: &str) -> BenchmarkOperationResult {
+        let mut latencies_us = Vec::with_capacity(iterations);
+        let mut errors = 0usize;
+
+        match operation {
+            "write" => {
+                for i in 0..iterations {
+                    let start = std::time::Instant::now();
+                    self.add_memory(AddMemoryRequest {
+                        content: format!("Benchmark memory {} for write test", i),
+                        memory_type: MemoryType::Fact,
+                        agent_id: Some(agent_id.to_string()),
+                        user_id: None,
+                        session_id: None,
+                        tags: vec!["benchmark".into()],
+                        metadata: serde_json::Value::Null,
+                    });
+                    latencies_us.push(start.elapsed().as_micros() as f64);
+                }
+            }
+            "bulk_write" => {
+                let batch_size = 10;
+                let batches = iterations / batch_size;
+                for b in 0..batches.max(1) {
+                    let reqs: Vec<AddMemoryRequest> = (0..batch_size)
+                        .map(|i| AddMemoryRequest {
+                            content: format!("Benchmark bulk memory batch {} item {}", b, i),
+                            memory_type: MemoryType::Fact,
+                            agent_id: Some(agent_id.to_string()),
+                            user_id: None,
+                            session_id: None,
+                            tags: vec!["benchmark".into()],
+                            metadata: serde_json::Value::Null,
+                        })
+                        .collect();
+                    let start = std::time::Instant::now();
+                    self.add_memories_bulk(reqs);
+                    latencies_us.push(start.elapsed().as_micros() as f64);
+                }
+            }
+            "keyword_search" => {
+                // Seed some data if empty
+                if self.memories.is_empty() {
+                    for i in 0..10 {
+                        self.add_memory(AddMemoryRequest {
+                            content: format!("Benchmark seed memory {} for search test", i),
+                            memory_type: MemoryType::Fact,
+                            agent_id: Some(agent_id.to_string()),
+                            user_id: None,
+                            session_id: None,
+                            tags: vec!["benchmark".into()],
+                            metadata: serde_json::Value::Null,
+                        });
+                    }
+                }
+                for _ in 0..iterations {
+                    let start = std::time::Instant::now();
+                    let _ = self.search(&SearchRequest {
+                        query: "benchmark memory search test".into(),
+                        agent_id: None,
+                        user_id: None,
+                        tags: vec![],
+                        limit: 10,
+                        include_graph: false,
+                    });
+                    latencies_us.push(start.elapsed().as_micros() as f64);
+                }
+            }
+            "semantic_search" => {
+                if !self.embeddings.is_available() {
+                    return BenchmarkOperationResult {
+                        operation: operation.to_string(),
+                        iterations: 0,
+                        total_ms: 0.0,
+                        latency: compute_latency_stats(&[]),
+                        ops_per_second: 0.0,
+                        errors: 1,
+                    };
+                }
+                for _ in 0..iterations {
+                    let start = std::time::Instant::now();
+                    let _ = self.search_hybrid(&SearchRequest {
+                        query: "benchmark semantic search test".into(),
+                        agent_id: None,
+                        user_id: None,
+                        tags: vec![],
+                        limit: 10,
+                        include_graph: false,
+                    }).await;
+                    latencies_us.push(start.elapsed().as_micros() as f64);
+                }
+            }
+            "entity_create" => {
+                for i in 0..iterations {
+                    let start = std::time::Instant::now();
+                    self.add_entity(AddEntityRequest {
+                        name: format!("BenchEntity-{}-{}", agent_id, i),
+                        entity_type: "benchmark".into(),
+                        description: Some("Benchmark entity".into()),
+                        agent_id: Some(agent_id.to_string()),
+                        metadata: serde_json::Value::Null,
+                    });
+                    latencies_us.push(start.elapsed().as_micros() as f64);
+                }
+            }
+            "graph_traverse" => {
+                // Create a small graph to traverse
+                let e1 = self.add_entity(AddEntityRequest {
+                    name: format!("BenchTraverseRoot-{}", agent_id),
+                    entity_type: "benchmark".into(),
+                    description: None,
+                    agent_id: Some(agent_id.to_string()),
+                    metadata: serde_json::Value::Null,
+                });
+                let e2 = self.add_entity(AddEntityRequest {
+                    name: format!("BenchTraverseChild-{}", agent_id),
+                    entity_type: "benchmark".into(),
+                    description: None,
+                    agent_id: Some(agent_id.to_string()),
+                    metadata: serde_json::Value::Null,
+                });
+                self.add_relationship(AddRelationshipRequest {
+                    source_entity_id: e1.id,
+                    target_entity_id: e2.id,
+                    relation_type: "benchmark_link".into(),
+                    description: None,
+                    weight: 1.0,
+                    created_by: agent_id.to_string(),
+                    metadata: serde_json::Value::Null,
+                });
+
+                for _ in 0..iterations {
+                    let start = std::time::Instant::now();
+                    let _ = self.traverse(e1.id, 2);
+                    latencies_us.push(start.elapsed().as_micros() as f64);
+                }
+            }
+            _ => {
+                errors = iterations;
+            }
+        }
+
+        let total_ms: f64 = latencies_us.iter().sum::<f64>() / 1000.0;
+        let ops_per_second = if total_ms > 0.0 {
+            (latencies_us.len() as f64) / (total_ms / 1000.0)
+        } else {
+            0.0
+        };
+
+        BenchmarkOperationResult {
+            operation: operation.to_string(),
+            iterations: latencies_us.len(),
+            total_ms,
+            latency: compute_latency_stats(&latencies_us),
+            ops_per_second,
+            errors,
+        }
+    }
+
+    /// Remove all benchmark data created by a specific benchmark run.
+    fn cleanup_benchmark_data(&self, agent_id: &str) {
+        // Remove memories
+        let memory_ids: Vec<u64> = self.memories.iter()
+            .filter(|m| m.value().agent_id.as_deref() == Some(agent_id))
+            .map(|m| *m.key())
+            .collect();
+        for id in &memory_ids {
+            if let Some((_, memory)) = self.memories.remove(id) {
+                self.unindex_memory_words(*id, &memory.content, &memory.tags);
+                self.embeddings.remove_memory(*id);
+            }
+            self.history.remove(id);
+        }
+
+        // Remove entities
+        let entity_ids: Vec<u64> = self.entities.iter()
+            .filter(|e| e.value().agent_id.as_deref() == Some(agent_id))
+            .map(|e| *e.key())
+            .collect();
+        for id in &entity_ids {
+            self.entities.remove(id);
+        }
+
+        // Remove relationships created by benchmark agent
+        let rel_ids: Vec<u64> = self.relationships.iter()
+            .filter(|r| r.value().created_by == agent_id)
+            .map(|r| *r.key())
+            .collect();
+        for id in &rel_ids {
+            self.relationships.remove(id);
+        }
+
+        info!(
+            agent_id,
+            memories = memory_ids.len(),
+            entities = entity_ids.len(),
+            relationships = rel_ids.len(),
+            "Benchmark data cleaned up"
+        );
+    }
+
     pub fn stats(&self) -> serde_json::Value {
         serde_json::json!({
             "memories": self.memories.len(),
@@ -1201,6 +1498,34 @@ impl MemoryEngine {
     }
 }
 
+fn compute_latency_stats(latencies: &[f64]) -> LatencyStats {
+    if latencies.is_empty() {
+        return LatencyStats {
+            min_us: 0.0,
+            max_us: 0.0,
+            avg_us: 0.0,
+            p50_us: 0.0,
+            p95_us: 0.0,
+            p99_us: 0.0,
+        };
+    }
+
+    let mut sorted = latencies.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let len = sorted.len();
+    let sum: f64 = sorted.iter().sum();
+
+    LatencyStats {
+        min_us: sorted[0],
+        max_us: sorted[len - 1],
+        avg_us: sum / len as f64,
+        p50_us: sorted[len / 2],
+        p95_us: sorted[(len as f64 * 0.95) as usize],
+        p99_us: sorted[((len as f64 * 0.99) as usize).min(len - 1)],
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1220,6 +1545,8 @@ mod tests {
             embedding_model: "none:disabled".into(),
             embedding_api_key: None,
             data_dir: "/tmp/hivemind-test".into(),
+            snapshot_interval: 60,
+            replication_enabled: false,
         }
     }
 

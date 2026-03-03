@@ -411,6 +411,206 @@ pub struct ExtractResponse {
 // WebSocket Message Types
 // ============================================================================
 
+// ============================================================================
+// Bulk Search Types
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct BulkSearchRequest {
+    pub queries: Vec<SearchRequest>,
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+}
+
+fn default_max_concurrent() -> usize {
+    10
+}
+
+#[derive(Debug, Serialize)]
+pub struct BulkSearchResponse {
+    pub results: Vec<BulkSearchQueryResult>,
+    pub total_results: usize,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BulkSearchQueryResult {
+    pub query_index: usize,
+    pub query: String,
+    pub results: Vec<SearchResult>,
+    pub error: Option<String>,
+}
+
+// ============================================================================
+// Benchmark Types
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct BenchmarkRequest {
+    #[serde(default = "default_benchmark_operations")]
+    pub operations: Vec<String>,
+    #[serde(default = "default_iterations")]
+    pub iterations: usize,
+    #[serde(default = "default_bench_concurrency")]
+    pub concurrency: usize,
+    #[serde(default = "default_true")]
+    pub cleanup: bool,
+}
+
+fn default_benchmark_operations() -> Vec<String> {
+    vec![
+        "write".into(),
+        "bulk_write".into(),
+        "keyword_search".into(),
+        "semantic_search".into(),
+        "entity_create".into(),
+        "graph_traverse".into(),
+    ]
+}
+
+fn default_iterations() -> usize {
+    100
+}
+
+fn default_bench_concurrency() -> usize {
+    1
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkResponse {
+    pub results: Vec<BenchmarkOperationResult>,
+    pub system_info: BenchmarkSystemInfo,
+    pub total_elapsed_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkOperationResult {
+    pub operation: String,
+    pub iterations: usize,
+    pub total_ms: f64,
+    pub latency: LatencyStats,
+    pub ops_per_second: f64,
+    pub errors: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LatencyStats {
+    pub min_us: f64,
+    pub max_us: f64,
+    pub avg_us: f64,
+    pub p50_us: f64,
+    pub p95_us: f64,
+    pub p99_us: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BenchmarkSystemInfo {
+    pub memories_before: usize,
+    pub memories_after: usize,
+    pub entities_before: usize,
+    pub entities_after: usize,
+    pub embedding_provider: String,
+    pub embedding_model: String,
+}
+
+// ============================================================================
+// System Introspection Types
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+pub struct SystemConfigResponse {
+    pub listen_addr: String,
+    pub data_dir: String,
+    pub embedding_model: String,
+    pub embedding_pool_size: usize,
+    pub llm_provider: String,
+    pub llm_model: String,
+    pub snapshot_interval: u64,
+    pub replication_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SystemTopologyResponse {
+    pub node_id: String,
+    pub listen_addr: String,
+    pub rtdb_url: String,
+    pub replication_enabled: bool,
+    pub role: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SystemHealthResponse {
+    pub status: String,
+    pub uptime_seconds: u64,
+    pub embedding: EmbeddingHealthInfo,
+    pub inverted_index: InvertedIndexHealthInfo,
+    pub memory_store: MemoryStoreHealthInfo,
+    pub knowledge_graph: KnowledgeGraphHealthInfo,
+    pub tasks: TasksHealthInfo,
+    pub websocket: WebSocketHealthInfo,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingHealthInfo {
+    pub available: bool,
+    pub provider: String,
+    pub model: String,
+    pub indexed_count: usize,
+    pub dimensions: u32,
+    pub pool_size: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvertedIndexHealthInfo {
+    pub unique_words: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemoryStoreHealthInfo {
+    pub total_memories: usize,
+    pub valid_memories: usize,
+    pub invalidated_memories: usize,
+    pub history_entries: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KnowledgeGraphHealthInfo {
+    pub entities: usize,
+    pub relationships: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TasksHealthInfo {
+    pub total: usize,
+    pub pending: usize,
+    pub in_progress: usize,
+    pub completed: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WebSocketHealthInfo {
+    pub active_connections: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SystemEmbeddingResponse {
+    pub provider: String,
+    pub model: String,
+    pub dimensions: u32,
+    pub indexed_count: usize,
+    pub pool_size: usize,
+    pub available: bool,
+}
+
+// ============================================================================
+// WebSocket Message Types
+// ============================================================================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsClientMessage {

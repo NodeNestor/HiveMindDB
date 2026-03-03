@@ -671,6 +671,8 @@ mod tests {
             embedding_model: "openai:text-embedding-3-small".into(),
             embedding_api_key: None,
             data_dir: "./data".into(),
+            snapshot_interval: 60,
+            replication_enabled: false,
         };
         let ec = EmbeddingConfig::from_hivemind_config(&config);
         assert_eq!(ec.provider, "openai");
@@ -691,6 +693,8 @@ mod tests {
             embedding_model: "ollama:nomic-embed-text".into(),
             embedding_api_key: None,
             data_dir: "./data".into(),
+            snapshot_interval: 60,
+            replication_enabled: false,
         };
         let ec = EmbeddingConfig::from_hivemind_config(&config);
         assert_eq!(ec.provider, "ollama");
@@ -710,6 +714,8 @@ mod tests {
             embedding_model: "local:all-MiniLM-L6-v2".into(),
             embedding_api_key: None,
             data_dir: "/data".into(),
+            snapshot_interval: 60,
+            replication_enabled: false,
         };
         let ec = EmbeddingConfig::from_hivemind_config(&config);
         assert_eq!(ec.provider, "local");
@@ -731,6 +737,8 @@ mod tests {
             embedding_model: "all-MiniLM-L6-v2".into(),
             embedding_api_key: None,
             data_dir: "./data".into(),
+            snapshot_interval: 60,
+            replication_enabled: false,
         };
         let ec = EmbeddingConfig::from_hivemind_config(&config);
         assert_eq!(ec.provider, "local");

@@ -88,6 +88,8 @@ async fn main() -> Result<()> {
         embedding_model: cli.embedding_model,
         embedding_api_key: cli.embedding_api_key,
         data_dir: cli.data_dir.clone(),
+        snapshot_interval: cli.snapshot_interval,
+        replication_enabled: cli.enable_replication,
     };
 
     // Shutdown signal

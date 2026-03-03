@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
@@ -15,10 +16,15 @@ use crate::websocket;
 pub struct AppState {
     pub engine: Arc<MemoryEngine>,
     pub channels: Arc<ChannelHub>,
+    pub started_at: DateTime<Utc>,
 }
 
 pub fn router(engine: Arc<MemoryEngine>, channels: Arc<ChannelHub>) -> Router {
-    let state = Arc::new(AppState { engine, channels });
+    let state = Arc::new(AppState {
+        engine,
+        channels,
+        started_at: Utc::now(),
+    });
 
     Router::new()
         // Memory endpoints
@@ -31,6 +37,7 @@ pub fn router(engine: Arc<MemoryEngine>, channels: Arc<ChannelHub>) -> Router {
         .route("/api/v1/memories", get(list_memories))
         // Search
         .route("/api/v1/search", post(search))
+        .route("/api/v1/search/bulk", post(bulk_search))
         // Extraction
         .route("/api/v1/extract", post(extract))
         // Knowledge Graph
@@ -59,6 +66,13 @@ pub fn router(engine: Arc<MemoryEngine>, channels: Arc<ChannelHub>) -> Router {
         .route("/api/v1/agents/{agent_id}/heartbeat", post(agent_heartbeat))
         // WebSocket
         .route("/ws", get(ws_upgrade))
+        // Benchmark
+        .route("/api/v1/benchmark/run", post(benchmark_run))
+        // System introspection
+        .route("/api/v1/system/config", get(system_config))
+        .route("/api/v1/system/topology", get(system_topology))
+        .route("/api/v1/system/health", get(system_health))
+        .route("/api/v1/system/embedding", get(system_embedding))
         // Status
         .route("/api/v1/status", get(status))
         .route("/health", get(health))
@@ -229,6 +243,63 @@ async fn search(
 ) -> Json<Vec<SearchResult>> {
     // Use hybrid search (includes vector similarity when available)
     Json(state.engine.search_hybrid(&req).await)
+}
+
+// ============================================================================
+// Bulk Search
+// ============================================================================
+
+async fn bulk_search(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BulkSearchRequest>,
+) -> Result<Json<BulkSearchResponse>, (StatusCode, String)> {
+    let num_queries = req.queries.len();
+    if num_queries > 100 {
+        return Err((StatusCode::BAD_REQUEST, "Maximum 100 queries per bulk request".into()));
+    }
+
+    let max_concurrent = req.max_concurrent.min(50);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    let start = std::time::Instant::now();
+
+    let mut handles = Vec::with_capacity(num_queries);
+    for (idx, query) in req.queries.into_iter().enumerate() {
+        let engine = state.engine.clone();
+        let sem = semaphore.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let query_text = query.query.clone();
+            let results = engine.search_hybrid(&query).await;
+            BulkSearchQueryResult {
+                query_index: idx,
+                query: query_text,
+                results,
+                error: None,
+            }
+        }));
+    }
+
+    let mut query_results = Vec::with_capacity(num_queries);
+    for handle in handles {
+        match handle.await {
+            Ok(result) => query_results.push(result),
+            Err(e) => query_results.push(BulkSearchQueryResult {
+                query_index: query_results.len(),
+                query: String::new(),
+                results: vec![],
+                error: Some(format!("Task failed: {}", e)),
+            }),
+        }
+    }
+
+    query_results.sort_by_key(|r| r.query_index);
+    let total_results: usize = query_results.iter().map(|r| r.results.len()).sum();
+
+    Ok(Json(BulkSearchResponse {
+        results: query_results,
+        total_results,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+    }))
 }
 
 // ============================================================================
@@ -541,6 +612,83 @@ async fn ws_upgrade(
 ) -> impl IntoResponse {
     let channels = state.channels.clone();
     ws.on_upgrade(move |socket| websocket::handle_ws_connection(socket, channels))
+}
+
+// ============================================================================
+// Benchmark
+// ============================================================================
+
+async fn benchmark_run(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BenchmarkRequest>,
+) -> Json<BenchmarkResponse> {
+    let engine = state.engine.clone();
+    let result = tokio::spawn(async move { engine.run_benchmark(&req).await })
+        .await
+        .unwrap();
+    Json(result)
+}
+
+// ============================================================================
+// System Introspection
+// ============================================================================
+
+async fn system_config(State(state): State<Arc<AppState>>) -> Json<SystemConfigResponse> {
+    let config = state.engine.config();
+    Json(SystemConfigResponse {
+        listen_addr: config.listen_addr.clone(),
+        data_dir: config.data_dir.clone(),
+        embedding_model: config.embedding_model.clone(),
+        embedding_pool_size: state.engine.embeddings().pool_size(),
+        llm_provider: config.llm_provider.clone(),
+        llm_model: config.llm_model.clone(),
+        snapshot_interval: config.snapshot_interval,
+        replication_enabled: config.replication_enabled,
+    })
+}
+
+async fn system_topology(State(state): State<Arc<AppState>>) -> Json<SystemTopologyResponse> {
+    let config = state.engine.config();
+    Json(SystemTopologyResponse {
+        node_id: hostname(),
+        listen_addr: config.listen_addr.clone(),
+        rtdb_url: config.rtdb_url.clone(),
+        replication_enabled: config.replication_enabled,
+        role: if config.replication_enabled { "replica".into() } else { "standalone".into() },
+    })
+}
+
+async fn system_health(State(state): State<Arc<AppState>>) -> Json<SystemHealthResponse> {
+    let (embedding, inverted_index, memory_store, knowledge_graph, tasks) =
+        state.engine.health_details();
+
+    let uptime = Utc::now()
+        .signed_duration_since(state.started_at)
+        .num_seconds()
+        .max(0) as u64;
+
+    Json(SystemHealthResponse {
+        status: "healthy".into(),
+        uptime_seconds: uptime,
+        embedding,
+        inverted_index,
+        memory_store,
+        knowledge_graph,
+        tasks,
+        websocket: WebSocketHealthInfo {
+            active_connections: state.channels.active_ws_count(),
+        },
+    })
+}
+
+async fn system_embedding(State(state): State<Arc<AppState>>) -> Json<SystemEmbeddingResponse> {
+    Json(state.engine.embedding_info())
+}
+
+fn hostname() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown".into())
 }
 
 // ============================================================================

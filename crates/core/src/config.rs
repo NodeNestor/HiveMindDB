@@ -8,4 +8,6 @@ pub struct HiveMindConfig {
     pub embedding_model: String,
     pub embedding_api_key: Option<String>,
     pub data_dir: String,
+    pub snapshot_interval: u64,
+    pub replication_enabled: bool,
 }

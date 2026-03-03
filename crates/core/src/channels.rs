@@ -12,6 +12,8 @@ pub struct ChannelHub {
     /// Broadcast senders per channel for WebSocket push.
     senders: DashMap<u64, broadcast::Sender<WsServerMessage>>,
     next_id: AtomicU64,
+    /// Active WebSocket connection counter.
+    active_ws_connections: AtomicU64,
 }
 
 impl ChannelHub {
@@ -22,7 +24,20 @@ impl ChannelHub {
             subscriptions: DashMap::new(),
             senders: DashMap::new(),
             next_id: AtomicU64::new(1),
+            active_ws_connections: AtomicU64::new(0),
         }
+    }
+
+    pub fn ws_connect(&self) {
+        self.active_ws_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn ws_disconnect(&self) {
+        self.active_ws_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn active_ws_count(&self) -> u64 {
+        self.active_ws_connections.load(Ordering::Relaxed)
     }
 
     pub fn create_channel(&self, req: CreateChannelRequest) -> Channel {

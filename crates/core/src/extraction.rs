@@ -408,6 +408,8 @@ mod tests {
             embedding_model: "".into(),
             embedding_api_key: None,
             data_dir: "".into(),
+            snapshot_interval: 60,
+            replication_enabled: false,
         };
         let ec = ExtractionConfig::from_hivemind_config(&config);
         assert_eq!(ec.base_url, "https://api.openai.com/v1");
@@ -425,6 +427,8 @@ mod tests {
             embedding_model: "".into(),
             embedding_api_key: None,
             data_dir: "".into(),
+            snapshot_interval: 60,
+            replication_enabled: false,
         };
         let ec = ExtractionConfig::from_hivemind_config(&config);
         assert_eq!(ec.base_url, "http://localhost:9212/v1");
@@ -442,6 +446,8 @@ mod tests {
             embedding_model: "".into(),
             embedding_api_key: None,
             data_dir: "".into(),
+            snapshot_interval: 60,
+            replication_enabled: false,
         };
         let ec = ExtractionConfig::from_hivemind_config(&config);
         assert_eq!(ec.base_url, "http://my-proxy:8080/v1");

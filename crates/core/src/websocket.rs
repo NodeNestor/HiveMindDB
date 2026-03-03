@@ -19,6 +19,7 @@ pub async fn handle_ws_connection(ws: WebSocket, channels: Arc<ChannelHub>) {
     let active_receivers: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
+    channels.ws_connect();
     info!("WebSocket client connected");
 
     // Task: forward internal messages to the WebSocket
@@ -75,6 +76,7 @@ pub async fn handle_ws_connection(ws: WebSocket, channels: Arc<ChannelHub>) {
     }
     forward_task.abort();
 
+    channels.ws_disconnect();
     info!("WebSocket client disconnected");
 }
 
