@@ -23,6 +23,7 @@ pub fn router(engine: Arc<MemoryEngine>, channels: Arc<ChannelHub>) -> Router {
     Router::new()
         // Memory endpoints
         .route("/api/v1/memories", post(add_memory))
+        .route("/api/v1/bulk/memories", post(add_memories_bulk))
         .route("/api/v1/memories/{id}", get(get_memory))
         .route("/api/v1/memories/{id}", put(update_memory))
         .route("/api/v1/memories/{id}", delete(invalidate_memory))
@@ -97,6 +98,26 @@ async fn add_memory(
     );
 
     (StatusCode::CREATED, Json(memory))
+}
+
+async fn add_memories_bulk(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BulkAddMemoryRequest>,
+) -> (StatusCode, Json<Vec<Memory>>) {
+    let memories = state.engine.add_memories_bulk(req.memories);
+
+    // Broadcast to global channel
+    for memory in &memories {
+        state.channels.broadcast_to_channel_by_name(
+            "global",
+            WsServerMessage::MemoryAdded {
+                channel: "global".into(),
+                memory: memory.clone(),
+            },
+        );
+    }
+
+    (StatusCode::CREATED, Json(memories))
 }
 
 async fn get_memory(

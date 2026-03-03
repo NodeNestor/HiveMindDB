@@ -9,12 +9,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Tokenize text into lowercase words for the inverted index.
+fn tokenize(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 2)
+        .map(|w| w.to_string())
+        .collect()
+}
+
 /// Core memory engine — manages memories, entities, relationships, and search.
 ///
 /// Integrates:
 /// - In-memory stores (DashMap) for low-latency access
+/// - Inverted index for O(1) keyword search
 /// - LLM extraction pipeline for automatic knowledge extraction
-/// - Vector embeddings for semantic search
+/// - Vector embeddings for semantic search (with model pool + rayon)
 /// - Snapshot persistence for restart recovery
 /// - Replication events for multi-node sync via RaftTimeDB
 pub struct MemoryEngine {
@@ -29,6 +39,8 @@ pub struct MemoryEngine {
     // Task stores
     tasks: DashMap<u64, Task>,
     task_events: DashMap<u64, Vec<TaskEvent>>,
+    // Inverted index: word → set of memory IDs containing that word
+    inverted_index: DashMap<String, Vec<u64>>,
     next_memory_id: AtomicU64,
     next_entity_id: AtomicU64,
     next_relationship_id: AtomicU64,
@@ -60,6 +72,7 @@ impl MemoryEngine {
             history: DashMap::new(),
             tasks: DashMap::new(),
             task_events: DashMap::new(),
+            inverted_index: DashMap::new(),
             next_memory_id: AtomicU64::new(1),
             next_entity_id: AtomicU64::new(1),
             next_relationship_id: AtomicU64::new(1),
@@ -141,12 +154,16 @@ impl MemoryEngine {
         self.next_task_id.store(max_task_id + 1, Ordering::Relaxed);
         self.next_task_event_id.store(max_task_event_id + 1, Ordering::Relaxed);
 
+        // Rebuild inverted index from restored memories
+        self.rebuild_inverted_index();
+
         info!(
             memories = self.memories.len(),
             entities = self.entities.len(),
             relationships = self.relationships.len(),
             agents = self.agents.len(),
             tasks = self.tasks.len(),
+            index_words = self.inverted_index.len(),
             "State restored from snapshot"
         );
     }
@@ -171,6 +188,45 @@ impl MemoryEngine {
     fn emit_replication(&self, event: ReplicationEvent) {
         if let Some(ref tx) = self.replication_tx {
             let _ = tx.send(event);
+        }
+    }
+
+    // ========================================================================
+    // Inverted Index Maintenance
+    // ========================================================================
+
+    /// Add a memory's words to the inverted index.
+    fn index_memory_words(&self, id: u64, content: &str, tags: &[String]) {
+        let mut words = tokenize(content);
+        for tag in tags {
+            words.extend(tokenize(tag));
+        }
+        for word in words {
+            self.inverted_index.entry(word).or_default().push(id);
+        }
+    }
+
+    /// Remove a memory's words from the inverted index.
+    fn unindex_memory_words(&self, id: u64, content: &str, tags: &[String]) {
+        let mut words = tokenize(content);
+        for tag in tags {
+            words.extend(tokenize(tag));
+        }
+        for word in words {
+            if let Some(mut ids) = self.inverted_index.get_mut(&word) {
+                ids.retain(|&mid| mid != id);
+            }
+        }
+    }
+
+    /// Rebuild the entire inverted index from scratch (used after snapshot restore).
+    fn rebuild_inverted_index(&self) {
+        self.inverted_index.clear();
+        for entry in self.memories.iter() {
+            let m = entry.value();
+            if m.valid_until.is_none() {
+                self.index_memory_words(m.id, &m.content, &m.tags);
+            }
         }
     }
 
@@ -214,6 +270,9 @@ impl MemoryEngine {
         self.history.entry(id).or_default().push(hist);
         self.memories.insert(id, memory.clone());
 
+        // Index in inverted index for fast keyword search
+        self.index_memory_words(id, &memory.content, &memory.tags);
+
         // Async: index embedding (fire-and-forget)
         if self.embeddings.is_available() {
             let emb = self.embeddings.clone();
@@ -245,6 +304,7 @@ impl MemoryEngine {
     ) -> Option<Memory> {
         let mut entry = self.memories.get_mut(&id)?;
         let old_content = entry.content.clone();
+        let old_tags = entry.tags.clone();
 
         if let Some(content) = &req.content {
             entry.content = content.clone();
@@ -266,7 +326,7 @@ impl MemoryEngine {
             id: hist_id,
             memory_id: id,
             operation: Operation::Update,
-            old_content: Some(old_content),
+            old_content: Some(old_content.clone()),
             new_content: entry.content.clone(),
             reason: "Manual update".into(),
             changed_by: changed_by.into(),
@@ -275,6 +335,10 @@ impl MemoryEngine {
         self.history.entry(id).or_default().push(hist);
 
         let memory = entry.clone();
+
+        // Update inverted index
+        self.unindex_memory_words(id, &old_content, &old_tags);
+        self.index_memory_words(id, &memory.content, &memory.tags);
 
         // Re-index embedding if content changed
         if req.content.is_some() && self.embeddings.is_available() {
@@ -313,8 +377,9 @@ impl MemoryEngine {
         };
         self.history.entry(id).or_default().push(hist);
 
-        // Remove from embedding index
+        // Remove from embedding index and inverted index
         self.embeddings.remove_memory(id);
+        self.unindex_memory_words(id, &entry.content, &entry.tags);
 
         let memory = entry.clone();
 
@@ -416,62 +481,137 @@ impl MemoryEngine {
         results
     }
 
-    /// Keyword-only search (synchronous, always available).
+    /// Keyword search using the inverted index for O(1) word lookups.
     fn search_keyword(&self, req: &SearchRequest) -> Vec<SearchResult> {
-        let query_lower = req.query.to_lowercase();
+        let query_words = tokenize(&req.query);
+        if query_words.is_empty() {
+            return vec![];
+        }
 
-        let mut results: Vec<SearchResult> = self
-            .memories
-            .iter()
-            .filter(|entry| {
-                let m = entry.value();
-                if m.valid_until.is_some() {
-                    return false;
+        // Use the inverted index to find candidate memory IDs
+        let mut candidate_counts: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::new();
+
+        for word in &query_words {
+            if let Some(ids) = self.inverted_index.get(word) {
+                for &id in ids.value() {
+                    *candidate_counts.entry(id).or_insert(0) += 1;
                 }
+            }
+        }
+
+        // Score and filter candidates
+        let total_words = query_words.len();
+        let mut results: Vec<SearchResult> = candidate_counts
+            .into_iter()
+            .filter_map(|(id, match_count)| {
+                let m = self.memories.get(&id)?;
+                let m = m.value();
+
+                // Filter out invalidated
+                if m.valid_until.is_some() {
+                    return None;
+                }
+                // Filter by agent
                 if let Some(ref agent_id) = req.agent_id {
                     if m.agent_id.as_ref() != Some(agent_id) && m.agent_id.is_some() {
-                        return false;
+                        return None;
                     }
                 }
+                // Filter by user
                 if let Some(ref user_id) = req.user_id {
                     if m.user_id.as_ref() != Some(user_id) && m.user_id.is_some() {
-                        return false;
+                        return None;
                     }
                 }
-                if !req.tags.is_empty()
-                    && !req.tags.iter().any(|t| m.tags.contains(t))
-                {
-                    return false;
+                // Filter by tags
+                if !req.tags.is_empty() && !req.tags.iter().any(|t| m.tags.contains(t)) {
+                    return None;
                 }
-                m.content.to_lowercase().contains(&query_lower)
-                    || m.tags.iter().any(|t| t.to_lowercase().contains(&query_lower))
-            })
-            .map(|entry| {
-                let m = entry.value();
-                let content_lower = m.content.to_lowercase();
-                let score = if content_lower == query_lower {
-                    1.0
-                } else {
-                    let words: Vec<&str> = query_lower.split_whitespace().collect();
-                    let matches = words
-                        .iter()
-                        .filter(|w| content_lower.contains(*w))
-                        .count();
-                    matches as f32 / words.len().max(1) as f32
-                };
 
-                SearchResult {
+                let score = match_count as f32 / total_words as f32;
+
+                Some(SearchResult {
                     memory: m.clone(),
                     score,
                     related_entities: vec![],
                     related_relationships: vec![],
-                }
+                })
             })
             .collect();
 
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(req.limit);
         results
+    }
+
+    /// Bulk add multiple memories at once.
+    ///
+    /// More efficient than calling add_memory in a loop because it:
+    /// - Batch-embeds all memories in one ONNX call
+    /// - Reduces per-call overhead
+    pub fn add_memories_bulk(&self, requests: Vec<AddMemoryRequest>) -> Vec<Memory> {
+        let mut memories = Vec::with_capacity(requests.len());
+
+        for req in requests {
+            let id = self.next_memory_id.fetch_add(1, Ordering::Relaxed);
+            let now = Utc::now();
+
+            let memory = Memory {
+                id,
+                content: req.content.clone(),
+                memory_type: req.memory_type,
+                agent_id: req.agent_id.clone(),
+                user_id: req.user_id.clone(),
+                session_id: req.session_id,
+                confidence: 1.0,
+                tags: req.tags,
+                created_at: now,
+                updated_at: now,
+                valid_from: now,
+                valid_until: None,
+                source: req.agent_id.unwrap_or_else(|| "unknown".into()),
+                metadata: req.metadata,
+            };
+
+            // Record history
+            let hist_id = self.next_history_id.fetch_add(1, Ordering::Relaxed);
+            let hist = MemoryHistory {
+                id: hist_id,
+                memory_id: id,
+                operation: Operation::Add,
+                old_content: None,
+                new_content: req.content,
+                reason: "Initial creation (bulk)".into(),
+                changed_by: memory.source.clone(),
+                timestamp: now,
+            };
+            self.history.entry(id).or_default().push(hist);
+            self.memories.insert(id, memory.clone());
+
+            // Index in inverted index
+            self.index_memory_words(id, &memory.content, &memory.tags);
+
+            self.emit_replication(ReplicationEvent::MemoryAdded {
+                memory: memory.clone(),
+            });
+
+            memories.push(memory);
+        }
+
+        // Batch-embed all memories at once (fire-and-forget)
+        if self.embeddings.is_available() && !memories.is_empty() {
+            let emb = self.embeddings.clone();
+            let mems = memories.clone();
+            tokio::spawn(async move {
+                if let Err(e) = emb.index_memories(&mems).await {
+                    warn!(count = mems.len(), error = %e, "Failed to batch-index memory embeddings");
+                }
+            });
+        }
+
+        info!(count = memories.len(), "Bulk memories added");
+        memories
     }
 
     /// Get all memories, optionally filtered by agent/user.
@@ -1049,6 +1189,8 @@ impl MemoryEngine {
             "valid_memories": self.memories.iter().filter(|m| m.value().valid_until.is_none()).count(),
             "embeddings_indexed": self.embeddings.indexed_count(),
             "embedding_dimensions": self.embeddings.dimensions(),
+            "embedding_pool_size": self.embeddings.pool_size(),
+            "inverted_index_words": self.inverted_index.len(),
             "extraction_available": self.extraction.is_available(),
             "replication_enabled": self.replication_tx.is_some(),
             "tasks_total": self.tasks.len(),

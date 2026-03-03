@@ -1,6 +1,7 @@
 use crate::config::HiveMindConfig;
 use crate::types::*;
 use dashmap::DashMap;
+use rayon::prelude::*;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -13,7 +14,8 @@ use tracing::{debug, info, warn};
 ///   Uses all-MiniLM-L6-v2 (22M params, 384 dims) by default. CPU-only, ~22MB model.
 /// - **API**: External embedding APIs (OpenAI, Ollama, CodeGate, etc.)
 ///
-/// Caches embeddings in-memory and provides cosine similarity search.
+/// Uses a pool of model instances for concurrent embedding generation,
+/// and rayon parallel iterators for fast cosine similarity search.
 pub struct EmbeddingEngine {
     client: Client,
     config: EmbeddingConfig,
@@ -21,9 +23,13 @@ pub struct EmbeddingEngine {
     vectors: DashMap<u64, Vec<f32>>,
     /// Dimensionality (set after first embedding)
     dimensions: std::sync::atomic::AtomicU32,
-    /// Local ONNX embedding model (when provider = "local")
+    /// Pool of local ONNX embedding models for concurrent embedding.
+    /// Wrapped in Arc<Mutex> so they can be sent to spawn_blocking.
     #[cfg(feature = "local-embeddings")]
-    local_model: Option<Arc<std::sync::Mutex<fastembed::TextEmbedding>>>,
+    model_pool: Vec<Arc<std::sync::Mutex<fastembed::TextEmbedding>>>,
+    /// Round-robin counter for pool selection
+    #[cfg(feature = "local-embeddings")]
+    pool_counter: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +40,8 @@ pub struct EmbeddingConfig {
     pub base_url: String,
     pub dimensions: Option<u32>,
     pub cache_dir: Option<String>,
+    /// Number of model instances in the pool (default: num_cpus / 2, min 2)
+    pub pool_size: usize,
 }
 
 impl EmbeddingConfig {
@@ -68,6 +76,9 @@ impl EmbeddingConfig {
             .clone()
             .or_else(|| config.llm_api_key.clone());
 
+        // Pool size: half the CPU cores, minimum 2, maximum 8
+        let pool_size = (num_cpus() / 2).max(2).min(8);
+
         Self {
             provider,
             model,
@@ -75,8 +86,15 @@ impl EmbeddingConfig {
             base_url,
             dimensions: None,
             cache_dir: Some(format!("{}/embeddings", config.data_dir)),
+            pool_size,
         }
     }
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 /// OpenAI-compatible embeddings request.
@@ -168,38 +186,55 @@ fn resolve_local_model(name: &str) -> fastembed::EmbeddingModel {
     }
 }
 
+/// Create a single fastembed model instance.
+#[cfg(feature = "local-embeddings")]
+fn create_model_instance(
+    model_name: &str,
+    cache_dir: &Option<String>,
+    show_progress: bool,
+) -> Option<fastembed::TextEmbedding> {
+    let model_enum = resolve_local_model(model_name);
+    let mut init = fastembed::InitOptions::new(model_enum).with_show_download_progress(show_progress);
+    if let Some(cache_dir) = cache_dir {
+        init = init.with_cache_dir(std::path::PathBuf::from(cache_dir));
+    }
+    match fastembed::TextEmbedding::try_new(init) {
+        Ok(model) => Some(model),
+        Err(e) => {
+            warn!(error = %e, "Failed to create model instance");
+            None
+        }
+    }
+}
+
 impl EmbeddingEngine {
     pub fn new(config: EmbeddingConfig) -> Self {
         #[cfg(feature = "local-embeddings")]
-        let local_model = if config.provider == "local" {
-            let model_enum = resolve_local_model(&config.model);
+        let model_pool = if config.provider == "local" {
+            let pool_size = config.pool_size;
+            info!(
+                model = %config.model,
+                pool_size,
+                "Loading local embedding model pool (in-process ONNX, CPU-only)"
+            );
 
-            let mut init = fastembed::InitOptions::new(model_enum)
-                .with_show_download_progress(true);
-
-            if let Some(ref cache_dir) = config.cache_dir {
-                init = init.with_cache_dir(std::path::PathBuf::from(cache_dir));
-            }
-
-            match fastembed::TextEmbedding::try_new(init) {
-                Ok(model) => {
-                    info!(
-                        model = %config.model,
-                        "Local embedding model loaded (in-process ONNX, CPU-only)"
-                    );
-                    Some(Arc::new(std::sync::Mutex::new(model)))
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        model = %config.model,
-                        "Failed to load local embedding model — embeddings disabled"
-                    );
-                    None
+            let mut pool = Vec::with_capacity(pool_size);
+            for i in 0..pool_size {
+                if let Some(model) =
+                    create_model_instance(&config.model, &config.cache_dir, i == 0)
+                {
+                    pool.push(Arc::new(std::sync::Mutex::new(model)));
                 }
             }
+
+            if pool.is_empty() {
+                warn!("No embedding model instances created — embeddings disabled");
+            } else {
+                info!(count = pool.len(), "Embedding model pool ready");
+            }
+            pool
         } else {
-            None
+            Vec::new()
         };
 
         Self {
@@ -208,7 +243,9 @@ impl EmbeddingEngine {
             vectors: DashMap::new(),
             dimensions: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "local-embeddings")]
-            local_model,
+            model_pool,
+            #[cfg(feature = "local-embeddings")]
+            pool_counter: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -219,13 +256,22 @@ impl EmbeddingEngine {
     /// Check if the embedding engine is configured and ready.
     pub fn is_available(&self) -> bool {
         #[cfg(feature = "local-embeddings")]
-        if self.local_model.is_some() {
+        if !self.model_pool.is_empty() {
             return true;
         }
 
         self.config.api_key.is_some()
             || self.config.base_url.contains("localhost")
             || self.config.base_url.contains("127.0.0.1")
+    }
+
+    /// Pick the next model from the pool (round-robin).
+    #[cfg(feature = "local-embeddings")]
+    fn next_model_index(&self) -> usize {
+        let idx = self
+            .pool_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        idx % self.model_pool.len()
     }
 
     /// Generate an embedding for a single text.
@@ -239,41 +285,60 @@ impl EmbeddingEngine {
 
     /// Generate embeddings for multiple texts.
     ///
-    /// Uses local ONNX model when available, otherwise falls back to external API.
+    /// Uses local ONNX model pool when available, otherwise falls back to external API.
     pub async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
-        // Try local model first
+        // Try local model pool first
         #[cfg(feature = "local-embeddings")]
-        if let Some(ref model) = self.local_model {
-            return self.embed_local(model, texts).await;
+        if !self.model_pool.is_empty() {
+            return self.embed_local_pooled(texts).await;
         }
 
         // Fall back to external API
         self.embed_api(texts).await
     }
 
-    /// Embed using local ONNX model (runs on blocking thread pool).
+    /// Embed using a model from the pool (round-robin selection).
     #[cfg(feature = "local-embeddings")]
-    async fn embed_local(
-        &self,
-        model: &Arc<std::sync::Mutex<fastembed::TextEmbedding>>,
-        texts: &[String],
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
-        let model = model.clone();
+    async fn embed_local_pooled(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let idx = self.next_model_index();
+        let pool_len = self.model_pool.len();
         let texts = texts.to_vec();
 
+        // Try to find an unlocked model first (opportunistic, avoids blocking)
+        for offset in 0..pool_len {
+            let try_idx = (idx + offset) % pool_len;
+            if let Ok(mut model) = self.model_pool[try_idx].try_lock() {
+                let embeddings = model
+                    .embed(texts, None)
+                    .map_err(|e| anyhow::anyhow!("Local embedding failed: {}", e))?;
+
+                if let Some(first) = embeddings.first() {
+                    self.dimensions.store(
+                        first.len() as u32,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                return Ok(embeddings);
+            }
+        }
+
+        // All models busy — clone Arc and wait in spawn_blocking
+        let model_arc = self.model_pool[idx % pool_len].clone();
+
         let embeddings = tokio::task::spawn_blocking(move || {
-            let mut model = model.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+            let mut model = model_arc
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
             model
                 .embed(texts, None)
                 .map_err(|e| anyhow::anyhow!("Local embedding failed: {}", e))
         })
         .await??;
 
-        // Track dimensions
         if let Some(first) = embeddings.first() {
             self.dimensions.store(
                 first.len() as u32,
@@ -360,23 +425,33 @@ impl EmbeddingEngine {
         Ok(self.search_by_vector(&query_embedding, limit))
     }
 
-    /// Search by pre-computed vector.
+    /// Search by pre-computed vector using rayon parallel iteration.
     pub fn search_by_vector(
         &self,
         query_vec: &[f32],
         limit: usize,
     ) -> Vec<(u64, f32)> {
-        let mut scores: Vec<(u64, f32)> = self
+        // Collect keys+vectors into a vec for rayon (DashMap iter isn't Send)
+        let entries: Vec<(u64, Vec<f32>)> = self
             .vectors
             .iter()
-            .map(|entry| {
-                let score = cosine_similarity(query_vec, entry.value());
-                (*entry.key(), score)
-            })
+            .map(|entry| (*entry.key(), entry.value().clone()))
             .collect();
 
+        // Parallel cosine similarity computation
+        let mut scores: Vec<(u64, f32)> = entries
+            .par_iter()
+            .map(|(id, vec)| (*id, cosine_similarity(query_vec, vec)))
+            .collect();
+
+        // Partial sort: only need top `limit` results
+        if scores.len() > limit {
+            scores.select_nth_unstable_by(limit, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            scores.truncate(limit);
+        }
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scores.truncate(limit);
         scores
     }
 
@@ -404,9 +479,22 @@ impl EmbeddingEngine {
     pub fn model(&self) -> &str {
         &self.config.model
     }
+
+    /// Get pool size for status reporting.
+    pub fn pool_size(&self) -> usize {
+        #[cfg(feature = "local-embeddings")]
+        {
+            self.model_pool.len()
+        }
+        #[cfg(not(feature = "local-embeddings"))]
+        {
+            0
+        }
+    }
 }
 
 /// Cosine similarity between two vectors.
+#[inline]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -416,7 +504,30 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let mut norm_a = 0.0f32;
     let mut norm_b = 0.0f32;
 
-    for (x, y) in a.iter().zip(b.iter()) {
+    // Process in chunks of 4 for better auto-vectorization
+    let chunks = a.len() / 4;
+    let remainder = a.len() % 4;
+
+    for i in 0..chunks {
+        let base = i * 4;
+        let a0 = a[base];
+        let a1 = a[base + 1];
+        let a2 = a[base + 2];
+        let a3 = a[base + 3];
+        let b0 = b[base];
+        let b1 = b[base + 1];
+        let b2 = b[base + 2];
+        let b3 = b[base + 3];
+
+        dot += a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
+        norm_a += a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3;
+        norm_b += b0 * b0 + b1 * b1 + b2 * b2 + b3 * b3;
+    }
+
+    let base = chunks * 4;
+    for i in 0..remainder {
+        let x = a[base + i];
+        let y = b[base + i];
         dot += x * y;
         norm_a += x * x;
         norm_b += y * y;
@@ -485,6 +596,28 @@ mod tests {
     }
 
     #[test]
+    fn test_cosine_similarity_chunked_matches_simple() {
+        // Test with exactly 384 dims (like all-MiniLM-L6-v2)
+        let a: Vec<f32> = (0..384).map(|i| (i as f32 * 0.01).sin()).collect();
+        let b: Vec<f32> = (0..384).map(|i| (i as f32 * 0.01 + 0.5).sin()).collect();
+
+        let chunked = cosine_similarity(&a, &b);
+
+        // Compute reference without chunking
+        let dot: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let reference = dot / (na * nb);
+
+        assert!(
+            (chunked - reference).abs() < 1e-5,
+            "chunked={} reference={}",
+            chunked,
+            reference
+        );
+    }
+
+    #[test]
     fn test_hybrid_score() {
         // Pure keyword
         assert_eq!(hybrid_score(0.8, 0.0, 0.0), 0.8);
@@ -503,6 +636,7 @@ mod tests {
             base_url: "http://localhost:1234".into(),
             dimensions: Some(3),
             cache_dir: None,
+            pool_size: 0,
         });
 
         // Manually insert some vectors
@@ -612,6 +746,7 @@ mod tests {
             base_url: "http://localhost:1234".into(),
             dimensions: None,
             cache_dir: None,
+            pool_size: 0,
         });
 
         assert_eq!(engine.indexed_count(), 0);

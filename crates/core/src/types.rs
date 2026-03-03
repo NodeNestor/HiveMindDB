@@ -212,6 +212,11 @@ fn default_memory_type() -> MemoryType {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct BulkAddMemoryRequest {
+    pub memories: Vec<AddMemoryRequest>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpdateMemoryRequest {
     pub content: Option<String>,
     pub tags: Option<Vec<String>>,
